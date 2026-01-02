@@ -1,10 +1,14 @@
 from dotenv import load_dotenv
 load_dotenv()
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 import os
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
 import psycopg2
 from yookassa import Configuration, Payment
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 # Configure YooKassa
 shop_id = os.getenv("YOOKASSA_SHOP_ID")
@@ -333,3 +337,44 @@ def ensure_entry_payment(entry_id: int):
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/webhooks/telegram")
+async def telegram_webhook(request: Request):
+    if bot is None:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN is missing"}
+
+    payload = await request.json()
+
+    # 1) Сообщения
+    message = payload.get("message")
+    if message:
+        text = (message.get("text") or "").strip()
+        chat_id = message["chat"]["id"]
+
+        # /start
+        if text.startswith("/start"):
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Привет! Я бот оплат турниров. Если тебе пришлют команду /pay <id>, я дам кнопку оплаты."
+            )
+            return {"ok": True}
+
+        # /pay <entry_id>
+        if text.startswith("/pay"):
+            parts = text.split()
+            if len(parts) < 2:
+                await bot.send_message(chat_id=chat_id, text="Формат: /pay <entry_id>")
+                return {"ok": True}
+
+            entry_id = int(parts[1])
+
+            # TODO: на следующем шаге подцепим сюда твою готовую логику YooKassa,
+            # чтобы тут создавалась/возвращалась ссылка оплаты.
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"Принял. entry_id={entry_id}. Следующий шаг — подключить генерацию payment_url."
+            )
+            return {"ok": True}
+
+        return {"ok": True}
+
+    return {"ok": True}
