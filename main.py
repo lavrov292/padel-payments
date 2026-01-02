@@ -170,6 +170,79 @@ def pay_entry(entry_id: int):
     except Exception as e:
         return {"error": str(e)}
 
+def ensure_payment_url_for_entry(entry_id: int) -> str:
+    """Ensure payment URL exists for entry, create if needed. Returns confirmation_url."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise Exception("DATABASE_URL not set")
+    
+    if not shop_id or not secret_key:
+        raise Exception("YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY not set")
+
+    conn = psycopg2.connect(database_url, sslmode="require")
+    try:
+        with conn.cursor() as cur:
+            # 1) если ссылка уже есть — вернуть
+            cur.execute("""
+                select e.confirmation_url, t.price_rub
+                from entries e
+                join tournaments t on t.id = e.tournament_id
+                where e.id = %s
+            """, (entry_id,))
+            row = cur.fetchone()
+            if not row:
+                raise Exception(f"entry {entry_id} not found")
+
+            confirmation_url, price_rub = row
+            if confirmation_url:
+                return confirmation_url
+
+            # 2) создать платеж в YooKassa
+            return_url = os.getenv("PAYMENT_RETURN_URL") or "https://example.com/paid"
+
+            payment = Payment.create({
+                "amount": {"value": f"{price_rub:.2f}", "currency": "RUB"},
+                "confirmation": {"type": "redirect", "return_url": return_url},
+                "capture": True,
+                "description": "Tournament payment",
+            })
+
+            payment_id = payment.id
+            new_url = payment.confirmation.confirmation_url
+
+            # 3) сохранить в БД
+            cur.execute("""
+                update entries
+                set payment_id=%s,
+                    confirmation_url=%s
+                where id=%s
+            """, (payment_id, new_url, entry_id))
+            conn.commit()
+
+            return new_url
+    finally:
+        conn.close()
+
+
+def save_player_telegram_id_for_entry(entry_id: int, telegram_user_id: int) -> None:
+    """Save Telegram user ID for the player associated with the entry."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise Exception("DATABASE_URL not set")
+    
+    conn = psycopg2.connect(database_url, sslmode="require")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                update players p
+                set telegram_id = %s
+                from entries e
+                where e.player_id = p.id and e.id = %s
+            """, (telegram_user_id, entry_id))
+            conn.commit()
+    finally:
+        conn.close()
+
 @app.post("/webhooks/yookassa")
 async def yookassa_webhook(payload: dict = Body(...)):
     database_url = os.getenv("DATABASE_URL")
@@ -349,6 +422,7 @@ async def telegram_webhook(request: Request):
     if message:
         text = (message.get("text") or "").strip()
         chat_id = message["chat"]["id"]
+        from_user = message.get("from")
 
         # /start
         if text.startswith("/start"):
@@ -365,16 +439,68 @@ async def telegram_webhook(request: Request):
                 await bot.send_message(chat_id=chat_id, text="Формат: /pay <entry_id>")
                 return {"ok": True}
 
-            entry_id = int(parts[1])
-
-            # TODO: на следующем шаге подцепим сюда твою готовую логику YooKassa,
-            # чтобы тут создавалась/возвращалась ссылка оплаты.
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"Принял. entry_id={entry_id}. Следующий шаг — подключить генерацию payment_url."
-            )
-            return {"ok": True}
+            try:
+                entry_id = int(parts[1])
+                
+                # Parse telegram_user_id
+                telegram_user_id = None
+                if from_user and from_user.get("id"):
+                    telegram_user_id = from_user["id"]
+                    # Store Telegram user id
+                    save_player_telegram_id_for_entry(entry_id, telegram_user_id)
+                
+                # Get payment URL
+                payment_url = ensure_payment_url_for_entry(entry_id)
+                
+                # Create inline keyboard
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Оплатить", url=payment_url),
+                        InlineKeyboardButton("Получить ссылку", callback_data=f"get_link:{entry_id}")
+                    ]
+                ])
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ссылка на оплату для entry_id={entry_id}:",
+                    reply_markup=keyboard
+                )
+                return {"ok": True}
+            except ValueError as e:
+                await bot.send_message(chat_id=chat_id, text=f"Ошибка: {str(e)}")
+                return {"ok": True}
+            except Exception as e:
+                await bot.send_message(chat_id=chat_id, text=f"Ошибка при создании платежа: {str(e)}")
+                return {"ok": True}
 
         return {"ok": True}
+
+    # 2) Callback queries
+    callback_query = payload.get("callback_query")
+    if callback_query:
+        data = callback_query.get("data", "")
+        chat_id = callback_query["message"]["chat"]["id"]
+        message_id = callback_query["message"]["message_id"]
+        
+        if data.startswith("get_link:"):
+            try:
+                entry_id = int(data.split(":")[1])
+                payment_url = ensure_payment_url_for_entry(entry_id)
+                
+                # Answer callback query first
+                await bot.answer_callback_query(callback_query["id"])
+                
+                # Send plain text message with the link and instruction how to copy
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ссылка на оплату:\n\n{payment_url}\n\nЧтобы скопировать ссылку, нажмите на неё и удерживайте, затем выберите \"Копировать\"."
+                )
+                return {"ok": True}
+            except ValueError as e:
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                return {"ok": True}
+            except Exception as e:
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                return {"ok": True}
 
     return {"ok": True}
