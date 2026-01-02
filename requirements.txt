@@ -3,4 +3,4 @@ uvicorn
 psycopg2-binary
 python-dotenv
 yookassa
-
+python-telegram-bot==21.6
