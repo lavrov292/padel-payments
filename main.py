@@ -196,3 +196,140 @@ async def yookassa_webhook(payload: dict = Body(...)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.get("/admin/tournaments")
+def get_admin_tournaments():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return {"error": "missing DATABASE_URL"}
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        query = """
+            SELECT id, title, starts_at, price_rub
+            FROM tournaments
+            ORDER BY starts_at
+        """
+        
+        cur.execute(query)
+        rows = cur.fetchall()
+        
+        tournaments = []
+        for row in rows:
+            tournament_id, title, starts_at, price_rub = row
+            tournaments.append({
+                "id": tournament_id,
+                "title": title,
+                "starts_at": starts_at.isoformat() if starts_at else None,
+                "price_rub": price_rub
+            })
+        
+        cur.close()
+        conn.close()
+        
+        return tournaments
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/admin/entries/{entry_id}/ensure-payment")
+def ensure_entry_payment(entry_id: int):
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return {"error": "missing DATABASE_URL"}
+    
+    if not shop_id or not secret_key:
+        return {"error": "YooKassa not configured"}
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        # Check if entry has confirmation_url
+        check_query = """
+            SELECT confirmation_url
+            FROM entries
+            WHERE id = %s
+        """
+        
+        cur.execute(check_query, (entry_id,))
+        row = cur.fetchone()
+        
+        if not row:
+            cur.close()
+            conn.close()
+            return {"error": "entry not found"}
+        
+        confirmation_url = row[0]
+        
+        # If confirmation_url exists, return it
+        if confirmation_url:
+            cur.close()
+            conn.close()
+            return {"payment_url": confirmation_url}
+        
+        # Otherwise, create payment (same as /entries/{id}/pay)
+        # Load entry, tournament, player from DB
+        query = """
+            SELECT 
+                e.id,
+                e.tournament_id,
+                e.player_id,
+                t.price_rub,
+                t.title,
+                p.full_name
+            FROM entries e
+            JOIN tournaments t ON e.tournament_id = t.id
+            JOIN players p ON e.player_id = p.id
+            WHERE e.id = %s
+        """
+        
+        cur.execute(query, (entry_id,))
+        row = cur.fetchone()
+        
+        if not row:
+            cur.close()
+            conn.close()
+            return {"error": "entry not found"}
+        
+        entry_id_result, tournament_id, player_id, price_rub, tournament_title, player_name = row
+        
+        # Get return URL from env or use default
+        return_url = os.getenv("PAYMENT_RETURN_URL", "https://example.com/paid")
+        
+        # Create YooKassa payment
+        payment_data = {
+            "amount": {
+                "value": f"{price_rub:.2f}",
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": return_url
+            },
+            "description": "Tournament payment",
+            "capture": True
+        }
+        
+        payment = Payment.create(payment_data)
+        
+        payment_id = payment.id
+        confirmation_url_new = payment.confirmation.confirmation_url
+        
+        # Save payment_id and confirmation_url into entries table
+        update_query = """
+            UPDATE entries
+            SET payment_id = %s, confirmation_url = %s
+            WHERE id = %s
+        """
+        
+        cur.execute(update_query, (payment_id, confirmation_url_new, entry_id))
+        conn.commit()
+        
+        cur.close()
+        conn.close()
+        
+        return {"payment_url": confirmation_url_new}
+    except Exception as e:
+        return {"error": str(e)}
+
