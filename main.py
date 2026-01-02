@@ -140,7 +140,8 @@ def pay_entry(entry_id: int):
                 "type": "redirect",
                 "return_url": return_url
             },
-            "description": "Tournament payment"
+            "description": "Tournament payment",
+            "capture": True
         }
         
         payment = Payment.create(payment_data)
