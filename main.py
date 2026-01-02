@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
 import os
 from fastapi import FastAPI, Body, Request
@@ -257,6 +257,7 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 conn = psycopg2.connect(database_url, sslmode="require")
                 cur = conn.cursor()
                 
+                # Update payment status
                 update_query = """
                     UPDATE entries
                     SET payment_status = 'paid', paid_at = NOW()
@@ -266,8 +267,43 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 cur.execute(update_query, (payment_id,))
                 conn.commit()
                 
+                # Fetch player's telegram_id and tournament info
+                fetch_query = """
+                    SELECT 
+                        p.telegram_id,
+                        t.title,
+                        t.starts_at,
+                        t.price_rub
+                    FROM entries e
+                    JOIN players p ON e.player_id = p.id
+                    JOIN tournaments t ON e.tournament_id = t.id
+                    WHERE e.payment_id = %s
+                """
+                
+                cur.execute(fetch_query, (payment_id,))
+                row = cur.fetchone()
+                
                 cur.close()
                 conn.close()
+                
+                # Send Telegram notification if telegram_id exists and bot is available
+                if row and bot is not None:
+                    telegram_id, tournament_title, starts_at, price_rub = row
+                    if telegram_id:
+                        try:
+                            # Format starts_at if it exists
+                            starts_at_str = starts_at.strftime("%Y-%m-%d %H:%M") if starts_at else "Не указано"
+                            
+                            message = f"""✅ Оплата получена!
+
+Турнир: {tournament_title}
+Время: {starts_at_str}
+Сумма: {price_rub} ₽"""
+                            
+                            await bot.send_message(chat_id=telegram_id, text=message)
+                        except Exception as telegram_error:
+                            # Log error but don't fail the webhook
+                            pass
         
         return {"ok": True}
     except Exception as e:
@@ -426,11 +462,316 @@ async def telegram_webhook(request: Request):
 
         # /start
         if text.startswith("/start"):
-            await bot.send_message(
-                chat_id=chat_id,
-                text="Привет! Я бот оплат турниров. Если тебе пришлют команду /pay <id>, я дам кнопку оплаты."
+            # Get telegram_user_id
+            telegram_user_id = None
+            if from_user and from_user.get("id"):
+                telegram_user_id = from_user["id"]
+            
+            if not telegram_user_id:
+                await bot.send_message(chat_id=chat_id, text="Ошибка: не удалось определить ваш Telegram ID.")
+                return {"ok": True}
+            
+            # Create reply keyboard (always show)
+            keyboard = ReplyKeyboardMarkup(
+                [
+                    [KeyboardButton("Мои турниры"), KeyboardButton("Помощь")]
+                ],
+                resize_keyboard=True
             )
+            
+            database_url = os.getenv("DATABASE_URL")
+            if not database_url:
+                await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.", reply_markup=keyboard)
+                return {"ok": True}
+            
+            try:
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Check if player exists with this telegram_id
+                cur.execute("SELECT full_name FROM players WHERE telegram_id = %s", (telegram_user_id,))
+                row = cur.fetchone()
+                
+                if row:
+                    # Player exists, greet them
+                    player_name = row[0]
+                    welcome_text = f"Привет, {player_name}!"
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=welcome_text,
+                        reply_markup=keyboard
+                    )
+                else:
+                    # Player not found, create session and ask for Lunda name
+                    cur.execute("""
+                        INSERT INTO telegram_sessions (telegram_id, state, temp_name)
+                        VALUES (%s, 'awaiting_lunda_name', NULL)
+                        ON CONFLICT (telegram_id) 
+                        DO UPDATE SET state = 'awaiting_lunda_name', temp_name = NULL
+                    """, (telegram_user_id,))
+                    conn.commit()
+                    
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Напиши, как ты называешься в Lunda (слово в слово). Например: Иван Иванов",
+                        reply_markup=keyboard
+                    )
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                await bot.send_message(chat_id=chat_id, text=f"Ошибка: {str(e)}", reply_markup=keyboard)
+            
             return {"ok": True}
+        
+        # /whoami command
+        if text.startswith("/whoami"):
+            telegram_user_id = None
+            if from_user and from_user.get("id"):
+                telegram_user_id = from_user["id"]
+            
+            if telegram_user_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ваш Telegram ID: {telegram_user_id}"
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Не удалось определить ваш Telegram ID."
+                )
+            return {"ok": True}
+
+        # Handle text messages when session state is "awaiting_lunda_name"
+        # Skip if it's a known button or command
+        if text not in ["Мои турниры", "Помощь"] and not text.startswith("/"):
+            telegram_user_id = None
+            if from_user and from_user.get("id"):
+                telegram_user_id = from_user["id"]
+            
+            if telegram_user_id:
+                database_url = os.getenv("DATABASE_URL")
+                if database_url:
+                    try:
+                        conn = psycopg2.connect(database_url, sslmode="require")
+                        cur = conn.cursor()
+                        
+                        # Check if there's an active session with awaiting_lunda_name state
+                        cur.execute("""
+                            SELECT state, temp_name 
+                            FROM telegram_sessions 
+                            WHERE telegram_id = %s AND state = 'awaiting_lunda_name'
+                        """, (telegram_user_id,))
+                        session_row = cur.fetchone()
+                        
+                        if session_row:
+                            # User is in awaiting_lunda_name state, process the name
+                            provided_name = text.strip()
+                            
+                            # Store name in temp_name
+                            cur.execute("""
+                                UPDATE telegram_sessions 
+                                SET temp_name = %s 
+                                WHERE telegram_id = %s
+                            """, (provided_name, telegram_user_id))
+                            conn.commit()
+                            
+                            # Try to find player by name (case-insensitive)
+                            # Only consider players where telegram_id is null or empty
+                            cur.execute("""
+                                SELECT id, full_name, lunda_name 
+                                FROM players 
+                                WHERE (full_name ILIKE %s OR lunda_name ILIKE %s)
+                                  AND (telegram_id IS NULL OR telegram_id = '')
+                            """, (provided_name, provided_name))
+                            matches = cur.fetchall()
+                            
+                            if len(matches) == 1:
+                                # Exactly one match - link the player
+                                player_id = matches[0][0]
+                                cur.execute("""
+                                    UPDATE players 
+                                    SET telegram_id = %s, telegram_verified_at = NOW() 
+                                    WHERE id = %s
+                                """, (telegram_user_id, player_id))
+                                
+                                # Delete session
+                                cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
+                                conn.commit()
+                                
+                                cur.close()
+                                conn.close()
+                                
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text="✅ Готово! Теперь нажми «Мои турниры»."
+                                )
+                                return {"ok": True}
+                            else:
+                                # 0 or >1 matches - need manual linking
+                                cur.execute("""
+                                    UPDATE telegram_sessions 
+                                    SET state = 'needs_manual_link' 
+                                    WHERE telegram_id = %s
+                                """, (telegram_user_id,))
+                                conn.commit()
+                                
+                                # Get username if available
+                                username = from_user.get("username")
+                                username_str = f"@{username}" if username else "не указан"
+                                
+                                # Notify admin
+                                admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+                                if admin_chat_id and bot:
+                                    admin_message = f"""Требуется ручная привязка:
+
+Telegram ID: {telegram_user_id}
+Username: {username_str}
+Указанное имя: {provided_name}
+Найдено совпадений: {len(matches)}
+
+Пожалуйста, свяжите вручную."""
+                                    try:
+                                        await bot.send_message(chat_id=admin_chat_id, text=admin_message)
+                                    except Exception:
+                                        pass  # Ignore errors sending to admin
+                                
+                                cur.close()
+                                conn.close()
+                                
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text="Я не смог автоматически привязать. Я написал организатору, он свяжет вручную."
+                                )
+                                return {"ok": True}
+                        
+                        cur.close()
+                        conn.close()
+                    except Exception:
+                        # Ignore errors
+                        pass
+
+        # "Мои турниры" button
+        if text == "Мои турниры":
+            # Get telegram_user_id
+            telegram_user_id = None
+            if from_user and from_user.get("id"):
+                telegram_user_id = from_user["id"]
+            
+            if not telegram_user_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка: не удалось определить ваш Telegram ID."
+                )
+                return {"ok": True}
+            
+            database_url = os.getenv("DATABASE_URL")
+            if not database_url:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка: база данных не настроена."
+                )
+                return {"ok": True}
+            
+            try:
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Find player by telegram_id
+                cur.execute("SELECT id FROM players WHERE telegram_id = %s", (telegram_user_id,))
+                player_row = cur.fetchone()
+                
+                if not player_row:
+                    cur.close()
+                    conn.close()
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Я не нашёл тебя в базе. Напиши организатору, чтобы он добавил твой Telegram ID."
+                    )
+                    return {"ok": True}
+                
+                player_id = player_row[0]
+                
+                # Query future tournaments
+                query = """
+                    SELECT 
+                        e.id as entry_id,
+                        t.title,
+                        t.starts_at,
+                        t.location,
+                        t.price_rub,
+                        e.payment_status
+                    FROM entries e
+                    JOIN tournaments t ON e.tournament_id = t.id
+                    WHERE e.player_id = %s 
+                      AND t.starts_at >= NOW()
+                    ORDER BY t.starts_at
+                """
+                
+                cur.execute(query, (player_id,))
+                rows = cur.fetchall()
+                
+                cur.close()
+                conn.close()
+                
+                if not rows:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="У тебя нет предстоящих турниров."
+                    )
+                    return {"ok": True}
+                
+                # Send message for each entry
+                for row in rows:
+                    entry_id, title, starts_at, location, price_rub, payment_status = row
+                    
+                    # Format starts_at
+                    starts_at_str = starts_at.strftime("%d.%m.%Y %H:%M") if starts_at else "Не указано"
+                    
+                    # Format location
+                    location_str = location if location else "Не указано"
+                    
+                    # Format payment status
+                    status_emoji = "✅" if payment_status == "paid" else "⏳"
+                    status_text = "Оплачено" if payment_status == "paid" else "Не оплачено"
+                    
+                    # Build message
+                    message = f"""<b>{title}</b>
+
+📅 Время: {starts_at_str}
+📍 Место: {location_str}
+💰 Сумма: {price_rub} ₽
+{status_emoji} Статус: {status_text}"""
+                    
+                    # Create inline keyboard if not paid
+                    keyboard = None
+                    if payment_status != 'paid':
+                        try:
+                            payment_url = ensure_payment_url_for_entry(entry_id)
+                            keyboard = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("Оплатить", url=payment_url),
+                                    InlineKeyboardButton("Получить ссылку", callback_data=f"get_link:{entry_id}")
+                                ]
+                            ])
+                        except Exception as e:
+                            # If payment URL creation fails, send message without buttons
+                            pass
+                    
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    )
+                
+                return {"ok": True}
+            except Exception as e:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ошибка при получении турниров: {str(e)}"
+                )
+                return {"ok": True}
 
         # /pay <entry_id>
         if text.startswith("/pay"):
