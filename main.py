@@ -3,13 +3,18 @@ load_dotenv()
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
 import os
-from fastapi import FastAPI, Body, Request
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, Body, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from yookassa import Configuration, Payment
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 # Configure YooKassa
 shop_id = os.getenv("YOOKASSA_SHOP_ID")
 secret_key = os.getenv("YOOKASSA_SECRET_KEY")
@@ -18,6 +23,18 @@ if shop_id and secret_key:
     Configuration.secret_key = secret_key
 
 app = FastAPI()
+
+# CORS middleware для локальной разработки
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 def health():
@@ -344,6 +361,67 @@ def get_admin_tournaments():
         return tournaments
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/admin/entries/{entry_id}/mark-manual-paid")
+async def mark_manual_paid(entry_id: int, body: dict = Body(...)):
+    """
+    Отмечает entry как оплаченное вручную.
+    Body: { "note": "cash" } (note опционально)
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return {"ok": False, "error": "missing DATABASE_URL"}
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        # Получаем payment_id и payment_status
+        cur.execute("""
+            SELECT payment_id, payment_status
+            FROM entries
+            WHERE id = %s
+        """, (entry_id,))
+        row = cur.fetchone()
+        
+        if not row:
+            cur.close()
+            conn.close()
+            return {"ok": False, "error": "entry not found"}
+        
+        payment_id, payment_status = row
+        
+        # Если есть payment_id и payment_status='pending', отменяем платеж в YooKassa
+        if payment_id and payment_status == 'pending':
+            try:
+                Payment.cancel(payment_id)
+                print(f"Payment {payment_id} cancelled successfully")
+            except Exception as cancel_error:
+                # Если cancel не удался, логируем предупреждение, но продолжаем
+                print(f"WARNING: Failed to cancel payment {payment_id}: {str(cancel_error)}")
+        
+        note = body.get("note")
+        
+        # Обновляем entry: помечаем как paid вручную и обнуляем payment_url и payment_id
+        update_query = """
+            UPDATE entries
+            SET payment_status = 'paid',
+                manual_paid = true,
+                manual_note = %s,
+                payment_url = NULL,
+                payment_id = NULL
+            WHERE id = %s
+        """
+        
+        cur.execute(update_query, (note, entry_id))
+        conn.commit()
+        
+        cur.close()
+        conn.close()
+        
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/admin/entries/{entry_id}/ensure-payment")
 def ensure_entry_payment(entry_id: int):
@@ -845,3 +923,130 @@ Username: {username_str}
                 return {"ok": True}
 
     return {"ok": True}
+
+    from fastapi import Query
+from datetime import datetime
+
+@app.post("/admin/process-new-entries")
+async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
+    """
+    Находит активные entries без payment_url и создает платежи.
+    Если у игрока есть telegram_id — отправляет сообщение.
+    limit — защита от массовых ошибочных созданий.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        select
+          e.id as entry_id,
+          t.title,
+          t.starts_at,
+          t.price_rub,
+          p.full_name,
+          p.telegram_id
+        from entries e
+        join tournaments t on t.id = e.tournament_id
+        join players p on p.id = e.player_id
+        where e.is_active = true
+          and p.telegram_id IS NOT NULL
+          and e.telegram_notified = false
+        order by e.created_at asc
+        limit %s
+    """, (limit,))
+    rows = cur.fetchall()
+
+    processed = 0
+    notified = 0
+
+    for (entry_id, title, starts_at, price_rub, full_name, telegram_id) in rows:
+        print("PROCESS ENTRY", entry_id)
+        
+        # Вычисляем expires_at
+        now_utc = datetime.now(timezone.utc)
+        if starts_at:
+            # Конвертируем starts_at в UTC datetime
+            if isinstance(starts_at, datetime):
+                if starts_at.tzinfo is None:
+                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                else:
+                    starts_at_utc = starts_at.astimezone(timezone.utc)
+                
+                # Если starts_at в будущем: expires_at = starts_at + 3 часа
+                if starts_at_utc > now_utc:
+                    expires_at = starts_at_utc + timedelta(hours=3)
+                else:
+                    # Если starts_at в прошлом: expires_at = now + 24 часа
+                    expires_at = now_utc + timedelta(hours=24)
+            else:
+                # Если starts_at не datetime, используем now + 24 часа
+                expires_at = now_utc + timedelta(hours=24)
+        else:
+            # Если starts_at NULL: expires_at = now + 24 часа
+            expires_at = now_utc + timedelta(hours=24)
+        
+        # Преобразуем в ISO8601 UTC строку
+        expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
+        
+        # создаем платеж
+        payment = Payment.create({
+            "amount": {"value": f"{float(price_rub):.2f}", "currency": "RUB"},
+            "confirmation": {
+                "type": "redirect",
+                "return_url": "https://example.com/paid"
+            },
+            "capture": True,
+            "description": f"Padel tournament: {title}",
+            "metadata": {"entry_id": str(entry_id), "player": full_name},
+            "expires_at": expires_at_str
+        })
+
+        payment_url = payment.confirmation.confirmation_url
+        payment_id_new = payment.id
+
+        cur.execute("""
+            update entries
+            set payment_id = %s,
+                payment_url = %s,
+                payment_status = 'pending'
+            where id = %s
+        """, (payment_id_new, payment_url, entry_id))
+        conn.commit()
+        processed += 1
+
+        # уведомление в телеграм
+        if telegram_id and bot is not None:
+            try:
+                chat_id = int(telegram_id)
+                print("TG SEND", telegram_id)
+
+                msg = (
+                    "🎾 Ты записан на турнир!\n\n"
+                    f"🏷️ {title}\n"
+                    f"🕒 {starts_at}\n"
+                    f"💳 {price_rub} ₽\n\n"
+                    "Оплата по ссылке:"
+                )
+
+                # Вызываем асинхронную функцию
+                await bot.send_message(chat_id=chat_id, text=msg)
+                await bot.send_message(chat_id=chat_id, text=payment_url)
+
+                # Обновляем telegram_notified после успешной отправки
+                cur.execute("""
+                    update entries
+                    set telegram_notified = true,
+                        telegram_notified_at = now()
+                    where id = %s
+                """, (entry_id,))
+                conn.commit()
+
+                print("TG OK", telegram_id)
+                notified += 1
+            except Exception as e:
+                print("TG ERROR", str(e))
+
+    cur.close()
+    conn.close()
+
+    return {"ok": True, "processed": processed, "notified": notified}
