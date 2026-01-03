@@ -996,13 +996,14 @@ from datetime import datetime
 @app.post("/admin/process-new-entries")
 async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
     """
-    Находит активные entries без payment_url и создает платежи.
+    Находит entries, которым нужно создать ссылку оплаты, и создает платежи.
     Если у игрока есть telegram_id — отправляет сообщение.
     limit — защита от массовых ошибочных созданий.
     """
     conn = get_db()
     cur = conn.cursor()
 
+    # Выбираем entries, которым нужно создать ссылку
     cur.execute("""
         select
           e.id as entry_id,
@@ -1014,9 +1015,10 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
         from entries e
         join tournaments t on t.id = e.tournament_id
         join players p on p.id = e.player_id
-        where e.is_active = true
-          and p.telegram_id IS NOT NULL
-          and e.telegram_notified = false
+        where e.payment_status = 'pending'
+          and e.payment_url IS NULL
+          and coalesce(e.manual_paid, false) = false
+          and (t.starts_at IS NULL OR t.starts_at > NOW() - INTERVAL '3 hours')
         order by e.created_at asc
         limit %s
     """, (limit,))
@@ -1070,17 +1072,17 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
         payment_url = payment.confirmation.confirmation_url
         payment_id_new = payment.id
 
+        # Записываем payment_id и payment_url в entries
         cur.execute("""
             update entries
             set payment_id = %s,
-                payment_url = %s,
-                payment_status = 'pending'
+                payment_url = %s
             where id = %s
         """, (payment_id_new, payment_url, entry_id))
         conn.commit()
         processed += 1
 
-        # уведомление в телеграм
+        # уведомление в телеграм (если есть telegram_id)
         if telegram_id and bot is not None:
             try:
                 chat_id = int(telegram_id)
