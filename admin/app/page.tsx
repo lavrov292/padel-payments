@@ -156,66 +156,72 @@ export default function AdminPage() {
                     </td>
                     <td className="py-1 px-2 border border-gray-500">
                       <div className="flex items-center gap-2 flex-wrap">
-                        {e.payment_url && (
+                        {e.payment_status === "paid" ? (
+                          <span className="text-green-400 text-xs">Оплачено</span>
+                        ) : (
                           <>
-                            <button
-                              className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
-                              onClick={async () => {
-                                try {
-                                  await navigator.clipboard.writeText(e.payment_url);
-                                  setCopiedEntryId(e.entry_id);
-                                  setTimeout(() => setCopiedEntryId(null), 2000);
-                                } catch (err) {
-                                  alert("Не удалось скопировать ссылку");
-                                }
-                              }}
-                            >
-                              Скопировать ссылку
-                            </button>
-                            {copiedEntryId === e.entry_id && (
-                              <span className="text-xs text-green-400">Скопировано!</span>
+                            {e.payment_url && (
+                              <>
+                                <button
+                                  className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                                  onClick={async () => {
+                                    try {
+                                      await navigator.clipboard.writeText(e.payment_url);
+                                      setCopiedEntryId(e.entry_id);
+                                      setTimeout(() => setCopiedEntryId(null), 2000);
+                                    } catch (err) {
+                                      alert("Не удалось скопировать ссылку");
+                                    }
+                                  }}
+                                >
+                                  Скопировать ссылку
+                                </button>
+                                {copiedEntryId === e.entry_id && (
+                                  <span className="text-xs text-green-400">Скопировано!</span>
+                                )}
+                              </>
+                            )}
+                            {e.payment_status === "pending" && (
+                              <button
+                                className="px-3 py-1.5 text-xs font-medium bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
+                                onClick={async () => {
+                                  if (!confirm("Отметить оплату вручную?")) return;
+                                  
+                                  const res = await fetch(
+                                    `${apiBase}/admin/entries/${e.entry_id}/mark-manual-paid`,
+                                    {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ note: "manual" }),
+                                    }
+                                  );
+                                  
+                                  const json = await res.json();
+                                  if (json.ok) {
+                                    // Перезагружаем список entries
+                                    const { data: rows } = await supabase
+                                      .from("admin_entries_view")
+                                      .select("*")
+                                      .eq("tournament_id", t.tournament_id);
+                                    setEntries(rows || []);
+                                    
+                                    // Перезагружаем список турниров
+                                    const { data: fresh } = await supabase
+                                      .from("admin_tournaments_view")
+                                      .select("*");
+                                    setData(fresh || []);
+                                  } else {
+                                    alert(`Ошибка: ${json.error || "неизвестная ошибка"}`);
+                                  }
+                                }}
+                              >
+                                Отметить оплату (вручную)
+                              </button>
+                            )}
+                            {!e.payment_url && e.payment_status !== "pending" && (
+                              <span className="text-gray-400 text-xs">—</span>
                             )}
                           </>
-                        )}
-                        {e.payment_status === "pending" && (
-                          <button
-                            className="px-3 py-1.5 text-xs font-medium bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
-                            onClick={async () => {
-                              if (!confirm("Отметить оплату вручную?")) return;
-                              
-                              const res = await fetch(
-                                `${apiBase}/admin/entries/${e.entry_id}/mark-manual-paid`,
-                                {
-                                  method: "POST",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ note: "manual" }),
-                                }
-                              );
-                              
-                              const json = await res.json();
-                              if (json.ok) {
-                                // Перезагружаем список entries
-                                const { data: rows } = await supabase
-                                  .from("admin_entries_view")
-                                  .select("*")
-                                  .eq("tournament_id", t.tournament_id);
-                                setEntries(rows || []);
-                                
-                                // Перезагружаем список турниров
-                                const { data: fresh } = await supabase
-                                  .from("admin_tournaments_view")
-                                  .select("*");
-                                setData(fresh || []);
-                              } else {
-                                alert(`Ошибка: ${json.error || "неизвестная ошибка"}`);
-                              }
-                            }}
-                          >
-                            Отметить оплату (вручную)
-                          </button>
-                        )}
-                        {!e.payment_url && e.payment_status !== "pending" && (
-                          <span className="text-gray-400 text-xs">—</span>
                         )}
                       </div>
                     </td>

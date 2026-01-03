@@ -3,6 +3,7 @@ load_dotenv()
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,8 +153,7 @@ def payment_entry_link(entry_id: int):
         return_url = os.getenv("PAYMENT_RETURN_URL", "https://example.com/paid")
         
         # Генерируем idempotence_key для предотвращения дублей
-        now_utc = datetime.now(timezone.utc)
-        idempotence_key = f"entry-{entry_id}-{now_utc.strftime('%Y%m%d%H')}"
+        idempotence_key = f"entry-{entry_id}-{uuid.uuid4()}"
         
         payment_data = {
             "amount": {
@@ -166,12 +166,11 @@ def payment_entry_link(entry_id: int):
             },
             "description": "Tournament payment",
             "capture": True,
-            "expires_at": expires_at_str,
-            "idempotence_key": idempotence_key
+            "expires_at": expires_at_str
         }
         
         print(f"PAYMENT CREATE PAYLOAD: entry_id={entry_id}, payload={payment_data}")
-        payment = Payment.create(payment_data)
+        payment = Payment.create(payment_data, idempotence_key)
         
         new_payment_id = payment.id
         new_confirmation_url = payment.confirmation.confirmation_url
