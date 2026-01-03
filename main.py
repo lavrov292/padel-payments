@@ -6,12 +6,14 @@ import os
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
 import psycopg2
 from yookassa import Configuration, Payment
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -53,6 +55,149 @@ def db_check():
         return {"db": "ok"}
     except Exception as e:
         return {"db": "error", "reason": str(e)}
+
+@app.get("/p/e/{entry_id}")
+def payment_entry_link(entry_id: int):
+    """
+    Вечная ссылка на оплату entry. Проверяет статус платежа и создает новый при необходимости.
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return HTMLResponse(content="<html><body>Ошибка: база данных не настроена</body></html>", status_code=500)
+    
+    if not shop_id or not secret_key:
+        return HTMLResponse(content="<html><body>Ошибка: YooKassa не настроен</body></html>", status_code=500)
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        # Читаем entry + tournament + player из БД
+        query = """
+            SELECT 
+                e.payment_status,
+                e.payment_id,
+                e.payment_url,
+                t.price_rub,
+                t.title,
+                t.starts_at,
+                p.full_name
+            FROM entries e
+            JOIN tournaments t ON e.tournament_id = t.id
+            JOIN players p ON e.player_id = p.id
+            WHERE e.id = %s
+        """
+        
+        cur.execute(query, (entry_id,))
+        row = cur.fetchone()
+        
+        if not row:
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body>Запись не найдена</body></html>", status_code=404)
+        
+        payment_status, payment_id, payment_url, price_rub, title, starts_at, full_name = row
+        
+        # Если уже оплачено
+        if payment_status == 'paid':
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body><h1>✅ Уже оплачено</h1></body></html>")
+        
+        # Если есть payment_id, проверяем статус в YooKassa
+        if payment_id:
+            try:
+                print(f"PAYMENT CHECK: entry_id={entry_id}, payment_id={payment_id}")
+                payment = Payment.find_one(payment_id)
+                print(f"PAYMENT STATUS: {payment.status}")
+                
+                # Если платеж pending и есть confirmation_url - редирект
+                if payment.status == 'pending' and payment.confirmation and payment.confirmation.confirmation_url:
+                    cur.close()
+                    conn.close()
+                    print(f"REDIRECT: using existing payment {payment_id}")
+                    return RedirectResponse(url=payment.confirmation.confirmation_url, status_code=302)
+                else:
+                    # Платеж не pending (succeeded/canceled/expired) - считаем невалидным
+                    print(f"PAYMENT INVALID: status={payment.status}, creating new")
+                    payment_id = None
+            except Exception as e:
+                # Платеж не найден или ошибка - считаем невалидным
+                print(f"PAYMENT ERROR: {str(e)}, creating new")
+                payment_id = None
+        
+        # Если платеж невалиден или payment_id пустой - создаем новый
+        print(f"CREATE NEW PAYMENT: entry_id={entry_id}")
+        
+        # Calculate expires_at
+        now_utc = datetime.now(timezone.utc)
+        if starts_at:
+            if isinstance(starts_at, datetime):
+                if starts_at.tzinfo is None:
+                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                else:
+                    starts_at_utc = starts_at.astimezone(timezone.utc)
+                
+                if starts_at_utc > now_utc:
+                    expires_at = starts_at_utc + timedelta(hours=3)
+                else:
+                    expires_at = now_utc + timedelta(hours=24)
+            else:
+                expires_at = now_utc + timedelta(hours=24)
+        else:
+            expires_at = now_utc + timedelta(hours=24)
+        
+        expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
+        
+        return_url = os.getenv("PAYMENT_RETURN_URL", "https://example.com/paid")
+        
+        # Генерируем idempotence_key для предотвращения дублей
+        now_utc = datetime.now(timezone.utc)
+        idempotence_key = f"entry-{entry_id}-{now_utc.strftime('%Y%m%d%H')}"
+        
+        payment_data = {
+            "amount": {
+                "value": f"{price_rub:.2f}",
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": return_url
+            },
+            "description": "Tournament payment",
+            "capture": True,
+            "expires_at": expires_at_str,
+            "idempotence_key": idempotence_key
+        }
+        
+        print(f"PAYMENT CREATE PAYLOAD: entry_id={entry_id}, payload={payment_data}")
+        payment = Payment.create(payment_data)
+        
+        new_payment_id = payment.id
+        new_confirmation_url = payment.confirmation.confirmation_url
+        
+        print(f"PAYMENT CREATED: payment_id={new_payment_id}, confirmation_url={new_confirmation_url}")
+        
+        # Сохраняем payment_id и payment_url в entries
+        update_query = """
+            UPDATE entries
+            SET payment_id = %s,
+                payment_url = %s
+            WHERE id = %s
+        """
+        
+        cur.execute(update_query, (new_payment_id, new_confirmation_url, entry_id))
+        conn.commit()
+        
+        cur.close()
+        conn.close()
+        
+        print(f"REDIRECT: using new payment {new_payment_id}")
+        return RedirectResponse(url=new_confirmation_url, status_code=302)
+        
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        return HTMLResponse(content=f"<html><body>Ошибка: {str(e)}</body></html>", status_code=500)
 
 @app.get("/tournaments/{tournament_id}")
 def get_tournament(tournament_id: int):
@@ -891,10 +1036,11 @@ Username: {username_str}
                     keyboard = None
                     if payment_status != 'paid':
                         try:
-                            payment_url = ensure_payment_url_for_entry(entry_id)
+                            # Используем вечную ссылку на наш сервис
+                            payment_link = f"{API_BASE_URL}/p/e/{entry_id}"
                             keyboard = InlineKeyboardMarkup([
                                 [
-                                    InlineKeyboardButton("Оплатить", url=payment_url),
+                                    InlineKeyboardButton("Оплатить", url=payment_link),
                                     InlineKeyboardButton("Получить ссылку", callback_data=f"get_link:{entry_id}")
                                 ]
                             ])
@@ -934,13 +1080,13 @@ Username: {username_str}
                     # Store Telegram user id
                     save_player_telegram_id_for_entry(entry_id, telegram_user_id)
                 
-                # Get payment URL
-                payment_url = ensure_payment_url_for_entry(entry_id)
+                # Используем вечную ссылку на наш сервис
+                payment_link = f"{API_BASE_URL}/p/e/{entry_id}"
                 
                 # Create inline keyboard
                 keyboard = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton("Оплатить", url=payment_url),
+                        InlineKeyboardButton("Оплатить", url=payment_link),
                         InlineKeyboardButton("Получить ссылку", callback_data=f"get_link:{entry_id}")
                     ]
                 ])
@@ -970,7 +1116,8 @@ Username: {username_str}
         if data.startswith("get_link:"):
             try:
                 entry_id = int(data.split(":")[1])
-                payment_url = ensure_payment_url_for_entry(entry_id)
+                # Используем вечную ссылку на наш сервис
+                payment_link = f"{API_BASE_URL}/p/e/{entry_id}"
                 
                 # Answer callback query first
                 await bot.answer_callback_query(callback_query["id"])
@@ -978,7 +1125,7 @@ Username: {username_str}
                 # Send plain text message with the link and instruction how to copy
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"Ссылка на оплату:\n\n{payment_url}\n\nЧтобы скопировать ссылку, нажмите на неё и удерживайте, затем выберите \"Копировать\"."
+                    text=f"Ссылка на оплату:\n\n{payment_link}\n\nЧтобы скопировать ссылку, нажмите на неё и удерживайте, затем выберите \"Копировать\"."
                 )
                 return {"ok": True}
             except ValueError as e:
