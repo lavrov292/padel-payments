@@ -132,6 +132,7 @@ def pay_entry(entry_id: int):
                 e.player_id,
                 t.price_rub,
                 t.title,
+                t.starts_at,
                 p.full_name
             FROM entries e
             JOIN tournaments t ON e.tournament_id = t.id
@@ -147,7 +148,27 @@ def pay_entry(entry_id: int):
             conn.close()
             return {"error": "entry not found"}
         
-        entry_id_result, tournament_id, player_id, price_rub, tournament_title, player_name = row
+        entry_id_result, tournament_id, player_id, price_rub, tournament_title, starts_at, player_name = row
+        
+        # Calculate expires_at
+        now_utc = datetime.now(timezone.utc)
+        if starts_at:
+            if isinstance(starts_at, datetime):
+                if starts_at.tzinfo is None:
+                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                else:
+                    starts_at_utc = starts_at.astimezone(timezone.utc)
+                
+                if starts_at_utc > now_utc:
+                    expires_at = starts_at_utc + timedelta(hours=3)
+                else:
+                    expires_at = now_utc + timedelta(hours=24)
+            else:
+                expires_at = now_utc + timedelta(hours=24)
+        else:
+            expires_at = now_utc + timedelta(hours=24)
+        
+        expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
         
         # Get return URL from env or use default
         return_url = os.getenv("PAYMENT_RETURN_URL", "https://example.com/paid")
@@ -163,7 +184,8 @@ def pay_entry(entry_id: int):
                 "return_url": return_url
             },
             "description": "Tournament payment",
-            "capture": True
+            "capture": True,
+            "expires_at": expires_at_str
         }
         
         payment = Payment.create(payment_data)
@@ -202,7 +224,7 @@ def ensure_payment_url_for_entry(entry_id: int) -> str:
         with conn.cursor() as cur:
             # 1) если ссылка уже есть — вернуть
             cur.execute("""
-                select e.confirmation_url, t.price_rub
+                select e.confirmation_url, t.price_rub, t.starts_at
                 from entries e
                 join tournaments t on t.id = e.tournament_id
                 where e.id = %s
@@ -211,11 +233,31 @@ def ensure_payment_url_for_entry(entry_id: int) -> str:
             if not row:
                 raise Exception(f"entry {entry_id} not found")
 
-            confirmation_url, price_rub = row
+            confirmation_url, price_rub, starts_at = row
             if confirmation_url:
                 return confirmation_url
 
             # 2) создать платеж в YooKassa
+            # Calculate expires_at
+            now_utc = datetime.now(timezone.utc)
+            if starts_at:
+                if isinstance(starts_at, datetime):
+                    if starts_at.tzinfo is None:
+                        starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                    else:
+                        starts_at_utc = starts_at.astimezone(timezone.utc)
+                    
+                    if starts_at_utc > now_utc:
+                        expires_at = starts_at_utc + timedelta(hours=3)
+                    else:
+                        expires_at = now_utc + timedelta(hours=24)
+                else:
+                    expires_at = now_utc + timedelta(hours=24)
+            else:
+                expires_at = now_utc + timedelta(hours=24)
+            
+            expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
+            
             return_url = os.getenv("PAYMENT_RETURN_URL") or "https://example.com/paid"
 
             payment = Payment.create({
@@ -223,6 +265,7 @@ def ensure_payment_url_for_entry(entry_id: int) -> str:
                 "confirmation": {"type": "redirect", "return_url": return_url},
                 "capture": True,
                 "description": "Tournament payment",
+                "expires_at": expires_at_str
             })
 
             payment_id = payment.id
@@ -469,6 +512,7 @@ def ensure_entry_payment(entry_id: int):
                 e.player_id,
                 t.price_rub,
                 t.title,
+                t.starts_at,
                 p.full_name
             FROM entries e
             JOIN tournaments t ON e.tournament_id = t.id
@@ -484,7 +528,27 @@ def ensure_entry_payment(entry_id: int):
             conn.close()
             return {"error": "entry not found"}
         
-        entry_id_result, tournament_id, player_id, price_rub, tournament_title, player_name = row
+        entry_id_result, tournament_id, player_id, price_rub, tournament_title, starts_at, player_name = row
+        
+        # Calculate expires_at
+        now_utc = datetime.now(timezone.utc)
+        if starts_at:
+            if isinstance(starts_at, datetime):
+                if starts_at.tzinfo is None:
+                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                else:
+                    starts_at_utc = starts_at.astimezone(timezone.utc)
+                
+                if starts_at_utc > now_utc:
+                    expires_at = starts_at_utc + timedelta(hours=3)
+                else:
+                    expires_at = now_utc + timedelta(hours=24)
+            else:
+                expires_at = now_utc + timedelta(hours=24)
+        else:
+            expires_at = now_utc + timedelta(hours=24)
+        
+        expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
         
         # Get return URL from env or use default
         return_url = os.getenv("PAYMENT_RETURN_URL", "https://example.com/paid")
@@ -500,7 +564,8 @@ def ensure_entry_payment(entry_id: int):
                 "return_url": return_url
             },
             "description": "Tournament payment",
-            "capture": True
+            "capture": True,
+            "expires_at": expires_at_str
         }
         
         payment = Payment.create(payment_data)
