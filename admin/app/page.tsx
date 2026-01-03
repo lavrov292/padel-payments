@@ -160,26 +160,23 @@ export default function AdminPage() {
                           <span className="text-green-400 text-xs">Оплачено</span>
                         ) : (
                           <>
-                            {e.payment_url && (
-                              <>
-                                <button
-                                  className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
-                                  onClick={async () => {
-                                    try {
-                                      await navigator.clipboard.writeText(e.payment_url);
-                                      setCopiedEntryId(e.entry_id);
-                                      setTimeout(() => setCopiedEntryId(null), 2000);
-                                    } catch (err) {
-                                      alert("Не удалось скопировать ссылку");
-                                    }
-                                  }}
-                                >
-                                  Скопировать ссылку
-                                </button>
-                                {copiedEntryId === e.entry_id && (
-                                  <span className="text-xs text-green-400">Скопировано!</span>
-                                )}
-                              </>
+                            <button
+                              className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                              onClick={async () => {
+                                try {
+                                  const permanentLink = `${apiBase}/p/e/${e.entry_id}`;
+                                  await navigator.clipboard.writeText(permanentLink);
+                                  setCopiedEntryId(e.entry_id);
+                                  setTimeout(() => setCopiedEntryId(null), 2000);
+                                } catch (err) {
+                                  alert("Не удалось скопировать ссылку");
+                                }
+                              }}
+                            >
+                              Скопировать ссылку
+                            </button>
+                            {copiedEntryId === e.entry_id && (
+                              <span className="text-xs text-green-400">Скопировано!</span>
                             )}
                             {e.payment_status === "pending" && (
                               <button
@@ -217,9 +214,6 @@ export default function AdminPage() {
                               >
                                 Отметить оплату (вручную)
                               </button>
-                            )}
-                            {!e.payment_url && e.payment_status !== "pending" && (
-                              <span className="text-gray-400 text-xs">—</span>
                             )}
                           </>
                         )}

@@ -15,6 +15,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -1036,7 +1037,7 @@ Username: {username_str}
                     if payment_status != 'paid':
                         try:
                             # Используем вечную ссылку на наш сервис
-                            payment_link = f"{API_BASE_URL}/p/e/{entry_id}"
+                            payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
                             keyboard = InlineKeyboardMarkup([
                                 [
                                     InlineKeyboardButton("Оплатить", url=payment_link),
@@ -1080,7 +1081,7 @@ Username: {username_str}
                     save_player_telegram_id_for_entry(entry_id, telegram_user_id)
                 
                 # Используем вечную ссылку на наш сервис
-                payment_link = f"{API_BASE_URL}/p/e/{entry_id}"
+                payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
                 
                 # Create inline keyboard
                 keyboard = InlineKeyboardMarkup([
@@ -1116,7 +1117,7 @@ Username: {username_str}
             try:
                 entry_id = int(data.split(":")[1])
                 # Используем вечную ссылку на наш сервис
-                payment_link = f"{API_BASE_URL}/p/e/{entry_id}"
+                payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
                 
                 # Answer callback query first
                 await bot.answer_callback_query(callback_query["id"])
@@ -1234,17 +1235,19 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 chat_id = int(telegram_id)
                 print("TG SEND", telegram_id)
 
+                # Используем вечную ссылку вместо прямого payment_url
+                permanent_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
+                
                 msg = (
                     "🎾 Ты записан на турнир!\n\n"
                     f"🏷️ {title}\n"
                     f"🕒 {starts_at}\n"
                     f"💳 {price_rub} ₽\n\n"
-                    "Оплата по ссылке:"
+                    f"Оплата по ссылке:\n{permanent_link}"
                 )
 
                 # Вызываем асинхронную функцию
                 await bot.send_message(chat_id=chat_id, text=msg)
-                await bot.send_message(chat_id=chat_id, text=payment_url)
 
                 # Обновляем telegram_notified после успешной отправки
                 cur.execute("""
