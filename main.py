@@ -5,6 +5,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+import pytz
 from fastapi import FastAPI, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -16,6 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+BOT_TZ = pytz.timezone(os.getenv("BOT_TZ", "Europe/Moscow"))
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -430,11 +432,14 @@ def ensure_payment_url_for_entry(entry_id: int) -> str:
         conn.close()
 
 
-def save_player_telegram_id_for_entry(entry_id: int, telegram_user_id: int) -> None:
-    """Save Telegram user ID for the player associated with the entry."""
+def save_player_telegram_id_for_entry(entry_id: int, telegram_user_id) -> None:
+    """Save Telegram user ID for the player associated with the entry. telegram_user_id should be a string."""
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise Exception("DATABASE_URL not set")
+    
+    # Ensure telegram_user_id is a string
+    telegram_user_id_str = str(telegram_user_id)
     
     conn = psycopg2.connect(database_url, sslmode="require")
     try:
@@ -444,7 +449,7 @@ def save_player_telegram_id_for_entry(entry_id: int, telegram_user_id: int) -> N
                 set telegram_id = %s
                 from entries e
                 where e.player_id = p.id and e.id = %s
-            """, (telegram_user_id, entry_id))
+            """, (telegram_user_id_str, entry_id))
             conn.commit()
     finally:
         conn.close()
@@ -741,20 +746,22 @@ async def telegram_webhook(request: Request):
         return {"ok": False, "error": "TELEGRAM_BOT_TOKEN is missing"}
 
     payload = await request.json()
+    print("TG UPDATE:", payload)
 
     # 1) Сообщения
     message = payload.get("message")
     if message:
         text = (message.get("text") or "").strip()
+        print("TG TEXT:", text)
         chat_id = message["chat"]["id"]
         from_user = message.get("from")
 
         # /start
         if text.startswith("/start"):
-            # Get telegram_user_id
+            # Get telegram_user_id (always convert to string)
             telegram_user_id = None
             if from_user and from_user.get("id"):
-                telegram_user_id = from_user["id"]
+                telegram_user_id = str(from_user["id"])
             
             if not telegram_user_id:
                 await bot.send_message(chat_id=chat_id, text="Ошибка: не удалось определить ваш Telegram ID.")
@@ -778,7 +785,8 @@ async def telegram_webhook(request: Request):
                 cur = conn.cursor()
                 
                 # Check if player exists with this telegram_id
-                cur.execute("SELECT full_name FROM players WHERE telegram_id = %s", (telegram_user_id,))
+                print("TG DEBUG /start telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
+                cur.execute("SELECT full_name FROM players WHERE telegram_id = %s::text", (telegram_user_id,))
                 row = cur.fetchone()
                 
                 if row:
@@ -817,7 +825,7 @@ async def telegram_webhook(request: Request):
         if text.startswith("/whoami"):
             telegram_user_id = None
             if from_user and from_user.get("id"):
-                telegram_user_id = from_user["id"]
+                telegram_user_id = str(from_user["id"])
             
             if telegram_user_id:
                 await bot.send_message(
@@ -836,7 +844,7 @@ async def telegram_webhook(request: Request):
         if text not in ["Мои турниры", "Помощь"] and not text.startswith("/"):
             telegram_user_id = None
             if from_user and from_user.get("id"):
-                telegram_user_id = from_user["id"]
+                telegram_user_id = str(from_user["id"])
             
             if telegram_user_id:
                 database_url = os.getenv("DATABASE_URL")
@@ -846,10 +854,11 @@ async def telegram_webhook(request: Request):
                         cur = conn.cursor()
                         
                         # Check if there's an active session with awaiting_lunda_name state
+                        print("TG DEBUG session check telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
                         cur.execute("""
                             SELECT state, temp_name 
                             FROM telegram_sessions 
-                            WHERE telegram_id = %s AND state = 'awaiting_lunda_name'
+                            WHERE telegram_id = %s::text AND state = 'awaiting_lunda_name'
                         """, (telegram_user_id,))
                         session_row = cur.fetchone()
                         
@@ -858,10 +867,11 @@ async def telegram_webhook(request: Request):
                             provided_name = text.strip()
                             
                             # Store name in temp_name
+                            print("TG DEBUG update session telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
                             cur.execute("""
                                 UPDATE telegram_sessions 
                                 SET temp_name = %s 
-                                WHERE telegram_id = %s
+                                WHERE telegram_id = %s::text
                             """, (provided_name, telegram_user_id))
                             conn.commit()
                             
@@ -885,7 +895,8 @@ async def telegram_webhook(request: Request):
                                 """, (telegram_user_id, player_id))
                                 
                                 # Delete session
-                                cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
+                                print("TG DEBUG delete session telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
+                                cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s::text", (telegram_user_id,))
                                 conn.commit()
                                 
                                 cur.close()
@@ -898,10 +909,11 @@ async def telegram_webhook(request: Request):
                                 return {"ok": True}
                             else:
                                 # 0 or >1 matches - need manual linking
+                                print("TG DEBUG manual link telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
                                 cur.execute("""
                                     UPDATE telegram_sessions 
                                     SET state = 'needs_manual_link' 
-                                    WHERE telegram_id = %s
+                                    WHERE telegram_id = %s::text
                                 """, (telegram_user_id,))
                                 conn.commit()
                                 
@@ -941,11 +953,13 @@ Username: {username_str}
                         pass
 
         # "Мои турниры" button
+        print("TG CHECK my_tournaments branch, text=", text)
         if text == "Мои турниры":
-            # Get telegram_user_id
+            print("TG ENTERED my_tournaments branch")
+            # Get telegram_user_id (always convert to string)
             telegram_user_id = None
             if from_user and from_user.get("id"):
-                telegram_user_id = from_user["id"]
+                telegram_user_id = str(from_user["id"])
             
             if not telegram_user_id:
                 await bot.send_message(
@@ -967,7 +981,10 @@ Username: {username_str}
                 cur = conn.cursor()
                 
                 # Find player by telegram_id
-                cur.execute("SELECT id FROM players WHERE telegram_id = %s", (telegram_user_id,))
+                # Гарантированно приводим к строке перед запросом
+                telegram_user_id = str(telegram_user_id)
+                print("DEBUG my_tournaments telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
+                cur.execute("SELECT id FROM players WHERE telegram_id = %s::text", (telegram_user_id,))
                 player_row = cur.fetchone()
                 
                 if not player_row:
@@ -975,26 +992,25 @@ Username: {username_str}
                     conn.close()
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="Я не нашёл тебя в базе. Напиши организатору, чтобы он добавил твой Telegram ID."
+                        text="Я тебя не нашёл в базе. Напиши как ты называешься в Lunda (Фамилия Имя)."
                     )
                     return {"ok": True}
                 
                 player_id = player_row[0]
                 
-                # Query future tournaments
+                # Query future tournaments (starts_at >= now())
                 query = """
                     SELECT 
                         e.id as entry_id,
                         t.title,
                         t.starts_at,
-                        t.location,
                         t.price_rub,
                         e.payment_status
                     FROM entries e
                     JOIN tournaments t ON e.tournament_id = t.id
                     WHERE e.player_id = %s 
                       AND t.starts_at >= NOW()
-                    ORDER BY t.starts_at
+                    ORDER BY t.starts_at ASC
                 """
                 
                 cur.execute(query, (player_id,))
@@ -1012,13 +1028,21 @@ Username: {username_str}
                 
                 # Send message for each entry
                 for row in rows:
-                    entry_id, title, starts_at, location, price_rub, payment_status = row
+                    entry_id, title, starts_at, price_rub, payment_status = row
                     
-                    # Format starts_at
-                    starts_at_str = starts_at.strftime("%d.%m.%Y %H:%M") if starts_at else "Не указано"
-                    
-                    # Format location
-                    location_str = location if location else "Не указано"
+                    # Format starts_at in MSK timezone
+                    if starts_at:
+                        # Convert to UTC if timezone-naive
+                        if starts_at.tzinfo is None:
+                            starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                        else:
+                            starts_at_utc = starts_at.astimezone(timezone.utc)
+                        
+                        # Convert to MSK
+                        starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M MSK")
+                    else:
+                        starts_at_str = "Не указано"
                     
                     # Format payment status
                     status_emoji = "✅" if payment_status == "paid" else "⏳"
@@ -1027,26 +1051,19 @@ Username: {username_str}
                     # Build message
                     message = f"""<b>{title}</b>
 
-📅 Время: {starts_at_str}
-📍 Место: {location_str}
-💰 Сумма: {price_rub} ₽
+📅 Дата/время: {starts_at_str}
 {status_emoji} Статус: {status_text}"""
                     
                     # Create inline keyboard if not paid
                     keyboard = None
                     if payment_status != 'paid':
-                        try:
-                            # Используем вечную ссылку на наш сервис
-                            payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
-                            keyboard = InlineKeyboardMarkup([
-                                [
-                                    InlineKeyboardButton("Оплатить", url=payment_link),
-                                    InlineKeyboardButton("Получить ссылку", callback_data=f"get_link:{entry_id}")
-                                ]
-                            ])
-                        except Exception as e:
-                            # If payment URL creation fails, send message without buttons
-                            pass
+                        # Используем вечную ссылку на наш сервис
+                        payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
+                        keyboard = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("Оплатить", url=payment_link)
+                            ]
+                        ])
                     
                     await bot.send_message(
                         chat_id=chat_id,
@@ -1073,10 +1090,10 @@ Username: {username_str}
             try:
                 entry_id = int(parts[1])
                 
-                # Parse telegram_user_id
+                # Parse telegram_user_id (always convert to string)
                 telegram_user_id = None
                 if from_user and from_user.get("id"):
-                    telegram_user_id = from_user["id"]
+                    telegram_user_id = str(from_user["id"])
                     # Store Telegram user id
                     save_player_telegram_id_for_entry(entry_id, telegram_user_id)
                 
