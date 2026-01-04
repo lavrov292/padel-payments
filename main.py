@@ -156,6 +156,7 @@ def payment_entry_link(entry_id: int):
                 t.price_rub,
                 t.title,
                 t.starts_at,
+                t.tournament_type,
                 p.full_name
             FROM entries e
             JOIN tournaments t ON e.tournament_id = t.id
@@ -171,7 +172,7 @@ def payment_entry_link(entry_id: int):
             conn.close()
             return HTMLResponse(content="<html><body>Запись не найдена</body></html>", status_code=404)
         
-        payment_status, payment_id, payment_url, price_rub, title, starts_at, full_name = row
+        payment_status, payment_id, payment_url, price_rub, title, starts_at, tournament_type, full_name = row
         
         # Если уже оплачено
         if payment_status == 'paid':
@@ -202,7 +203,15 @@ def payment_entry_link(entry_id: int):
                 payment_id = None
         
         # Если платеж невалиден или payment_id пустой - создаем новый
-        print(f"CREATE NEW PAYMENT: entry_id={entry_id}")
+        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}")
+        
+        # Calculate payment amount based on tournament type
+        if tournament_type == 'team':
+            # Team tournament: 50% of price
+            payment_amount = price_rub / 2
+        else:
+            # Personal tournament: full price
+            payment_amount = price_rub
         
         # Calculate expires_at
         now_utc = datetime.now(timezone.utc)
@@ -231,7 +240,7 @@ def payment_entry_link(entry_id: int):
         
         payment_data = {
             "amount": {
-                "value": f"{price_rub:.2f}",
+                "value": f"{payment_amount:.2f}",
                 "currency": "RUB"
             },
             "confirmation": {
@@ -270,6 +279,143 @@ def payment_entry_link(entry_id: int):
         
     except Exception as e:
         print(f"ERROR: {str(e)}")
+        return HTMLResponse(content=f"<html><body>Ошибка: {str(e)}</body></html>", status_code=500)
+
+@app.get("/p/team")
+def payment_team_link(payer_entry_id: int = Query(...), partner_entry_id: int = Query(...)):
+    """
+    Командная оплата за пару. Создает один платеж на полную стоимость для двух entries.
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return HTMLResponse(content="<html><body>Ошибка: база данных не настроена</body></html>", status_code=500)
+    
+    if not shop_id or not secret_key:
+        return HTMLResponse(content="<html><body>Ошибка: YooKassa не настроен</body></html>", status_code=500)
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        # Проверяем оба entries
+        query = """
+            SELECT 
+                e.id,
+                e.payment_status,
+                e.tournament_id,
+                t.tournament_type,
+                t.price_rub,
+                t.starts_at
+            FROM entries e
+            JOIN tournaments t ON e.tournament_id = t.id
+            WHERE e.id IN (%s, %s)
+        """
+        
+        cur.execute(query, (payer_entry_id, partner_entry_id))
+        rows = cur.fetchall()
+        
+        if len(rows) != 2:
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body>Ошибка: одна или обе записи не найдены</body></html>", status_code=404)
+        
+        # Проверяем условия
+        entry1_id, status1, tournament_id1, type1, price1, starts_at1 = rows[0]
+        entry2_id, status2, tournament_id2, type2, price2, starts_at2 = rows[1]
+        
+        # Проверка: один tournament_id
+        if tournament_id1 != tournament_id2:
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body>Ошибка: записи относятся к разным турнирам</body></html>", status_code=400)
+        
+        # Проверка: tournament_type = 'team'
+        if type1 != 'team':
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body>Ошибка: это не командный турнир</body></html>", status_code=400)
+        
+        # Проверка: оба payment_status = 'pending'
+        if status1 != 'pending' or status2 != 'pending':
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body>Один из игроков уже оплатил. Используйте оплату за себя.</body></html>", status_code=400)
+        
+        # Проверка: оба entry_id присутствуют
+        if payer_entry_id not in [entry1_id, entry2_id] or partner_entry_id not in [entry1_id, entry2_id]:
+            cur.close()
+            conn.close()
+            return HTMLResponse(content="<html><body>Ошибка: неверные entry_id</body></html>", status_code=400)
+        
+        # Создаем платеж на полную стоимость
+        price_rub = price1
+        starts_at = starts_at1
+        
+        # Calculate expires_at
+        now_utc = datetime.now(timezone.utc)
+        if starts_at:
+            if isinstance(starts_at, datetime):
+                if starts_at.tzinfo is None:
+                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                else:
+                    starts_at_utc = starts_at.astimezone(timezone.utc)
+                
+                if starts_at_utc > now_utc:
+                    expires_at = starts_at_utc + timedelta(hours=3)
+                else:
+                    expires_at = now_utc + timedelta(hours=24)
+            else:
+                expires_at = now_utc + timedelta(hours=24)
+        else:
+            expires_at = now_utc + timedelta(hours=24)
+        
+        expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
+        
+        return_url = os.getenv("PAYMENT_RETURN_URL", "https://example.com/paid")
+        
+        # Генерируем idempotence_key
+        idempotence_key = f"team-{payer_entry_id}-{partner_entry_id}-{uuid.uuid4()}"
+        
+        payment_data = {
+            "amount": {
+                "value": f"{price_rub:.2f}",
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": return_url
+            },
+            "description": "Team tournament payment (pair)",
+            "capture": True,
+            "expires_at": expires_at_str,
+            "idempotence_key": idempotence_key
+        }
+        
+        print(f"TEAM PAYMENT CREATE: payer_entry_id={payer_entry_id}, partner_entry_id={partner_entry_id}, payload={payment_data}")
+        payment = Payment.create(payment_data, idempotence_key)
+        
+        payment_id = payment.id
+        confirmation_url = payment.confirmation.confirmation_url
+        
+        # Сохраняем payment_id и payment_url в оба entries
+        update_query = """
+            UPDATE entries
+            SET payment_id = %s,
+                payment_url = %s
+            WHERE id IN (%s, %s)
+        """
+        
+        cur.execute(update_query, (payment_id, confirmation_url, payer_entry_id, partner_entry_id))
+        conn.commit()
+        
+        cur.close()
+        conn.close()
+        
+        print(f"TEAM PAYMENT CREATED: payment_id={payment_id}, entries={payer_entry_id},{partner_entry_id}")
+        return RedirectResponse(url=confirmation_url, status_code=302)
+        
+    except Exception as e:
+        print(f"TEAM PAYMENT ERROR: {str(e)}")
         return HTMLResponse(content=f"<html><body>Ошибка: {str(e)}</body></html>", status_code=500)
 
 @app.get("/tournaments/{tournament_id}")
@@ -539,7 +685,8 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 conn = psycopg2.connect(database_url, sslmode="require")
                 cur = conn.cursor()
                 
-                # Update payment status
+                # Update payment status for all entries with this payment_id
+                # (может быть один entry для personal или два для team)
                 update_query = """
                     UPDATE entries
                     SET payment_status = 'paid', paid_at = NOW()
@@ -549,13 +696,17 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 cur.execute(update_query, (payment_id,))
                 conn.commit()
                 
-                # Fetch player's telegram_id and tournament info
+                # Fetch all entries with this payment_id (for team payments there will be 2)
                 fetch_query = """
                     SELECT 
+                        e.id,
                         p.telegram_id,
                         t.title,
                         t.starts_at,
-                        t.price_rub
+                        t.price_rub,
+                        t.tournament_type,
+                        t.location,
+                        COUNT(*) OVER (PARTITION BY e.payment_id) as payment_count
                     FROM entries e
                     JOIN players p ON e.player_id = p.id
                     JOIN tournaments t ON e.tournament_id = t.id
@@ -563,29 +714,69 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 """
                 
                 cur.execute(fetch_query, (payment_id,))
-                row = cur.fetchone()
+                rows = cur.fetchall()
                 
                 cur.close()
                 conn.close()
                 
-                # Send Telegram notification if telegram_id exists and bot is available
-                if row and bot is not None:
-                    telegram_id, tournament_title, starts_at, price_rub = row
-                    if telegram_id:
-                        try:
-                            # Format starts_at if it exists
-                            starts_at_str = starts_at.strftime("%Y-%m-%d %H:%M") if starts_at else "Не указано"
-                            
-                            message = f"""✅ Оплата получена!
+                # Send Telegram notifications to all players whose status became paid
+                if rows and bot is not None:
+                    for row in rows:
+                        entry_id, telegram_id, tournament_title, starts_at, price_rub, tournament_type, location, payment_count = row
+                        if telegram_id:
+                            try:
+                                # Format starts_at in MSK
+                                if starts_at:
+                                    if isinstance(starts_at, datetime):
+                                        if starts_at.tzinfo is None:
+                                            starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                                        else:
+                                            starts_at_utc = starts_at.astimezone(timezone.utc)
+                                        starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M MSK")
+                                    else:
+                                        starts_at_str = str(starts_at)
+                                else:
+                                    starts_at_str = "Не указано"
+                                
+                                # Check if this is a team payment (2 entries with same payment_id)
+                                if payment_count == 2 and tournament_type == 'team':
+                                    # Team payment - find partner
+                                    # Get partner info
+                                    conn2 = psycopg2.connect(database_url, sslmode="require")
+                                    cur2 = conn2.cursor()
+                                    cur2.execute("""
+                                        SELECT p2.full_name
+                                        FROM entries e2
+                                        JOIN players p2 ON e2.player_id = p2.id
+                                        WHERE e2.payment_id = %s AND e2.id != %s
+                                    """, (payment_id, entry_id))
+                                    partner_row = cur2.fetchone()
+                                    partner_name = partner_row[0] if partner_row else "партнер"
+                                    cur2.close()
+                                    conn2.close()
+                                    
+                                    message = f"""✅ Оплата получена!
 
 Турнир: {tournament_title}
+Место: {location or 'Не указано'}
+Время: {starts_at_str}
+
+Партнер {partner_name} оплатил за пару."""
+                                else:
+                                    # Personal payment or single team payment
+                                    message = f"""✅ Оплата получена!
+
+Турнир: {tournament_title}
+Место: {location or 'Не указано'}
 Время: {starts_at_str}
 Сумма: {price_rub} ₽"""
-                            
-                            await bot.send_message(chat_id=telegram_id, text=message)
-                        except Exception as telegram_error:
-                            # Log error but don't fail the webhook
-                            pass
+                                
+                                await bot.send_message(chat_id=telegram_id, text=message)
+                            except Exception as telegram_error:
+                                # Log error but don't fail the webhook
+                                print(f"Telegram notification error: {telegram_error}")
+                                pass
         
         return {"ok": True}
     except Exception as e:
@@ -1130,6 +1321,7 @@ Username: {username_str}
                         t.title,
                         t.starts_at,
                         t.price_rub,
+                        t.tournament_type,
                         e.payment_status
                     FROM entries e
                     JOIN tournaments t ON e.tournament_id = t.id
@@ -1153,7 +1345,7 @@ Username: {username_str}
                 
                 # Send message for each entry
                 for row in rows:
-                    entry_id, title, starts_at, price_rub, payment_status = row
+                    entry_id, title, starts_at, price_rub, tournament_type, payment_status = row
                     
                     # Format starts_at in MSK timezone
                     if starts_at:
@@ -1182,13 +1374,21 @@ Username: {username_str}
                     # Create inline keyboard if not paid
                     keyboard = None
                     if payment_status != 'paid':
-                        # Используем вечную ссылку на наш сервис
-                        payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
-                        keyboard = InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("Оплатить", url=payment_link)
-                            ]
-                        ])
+                        if tournament_type == 'team':
+                            # Team tournament - show choice button
+                            keyboard = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("Оплатить", callback_data=f"team_pay_choice:{entry_id}")
+                                ]
+                            ])
+                        else:
+                            # Personal tournament - direct payment link
+                            payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
+                            keyboard = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("Оплатить", url=payment_link)
+                                ]
+                            ])
                     
                     await bot.send_message(
                         chat_id=chat_id,
@@ -1300,6 +1500,196 @@ Username: {username_str}
             except Exception as e:
                 await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
                 return {"ok": True}
+        
+        # Team payment choice: team_pay_choice:{entry_id}
+        if data.startswith("team_pay_choice:"):
+            try:
+                entry_id = int(data.split(":")[1])
+                await bot.answer_callback_query(callback_query["id"])
+                
+                # Get tournament info
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                cur.execute("""
+                    SELECT t.tournament_type
+                    FROM entries e
+                    JOIN tournaments t ON e.tournament_id = t.id
+                    WHERE e.id = %s
+                """, (entry_id,))
+                row = cur.fetchone()
+                
+                if not row or row[0] != 'team':
+                    cur.close()
+                    conn.close()
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: это не командный турнир.")
+                    return {"ok": True}
+                
+                # Ask how to pay
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Оплатить за себя", callback_data=f"team_pay_self:{entry_id}")
+                    ],
+                    [
+                        InlineKeyboardButton("Оплатить за пару", callback_data=f"team_pay_pair:{entry_id}")
+                    ]
+                ])
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Как вы хотите оплатить?",
+                    reply_markup=keyboard
+                )
+                
+                cur.close()
+                conn.close()
+                return {"ok": True}
+            except Exception as e:
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                return {"ok": True}
+        
+        # Team pay self: team_pay_self:{entry_id}
+        if data.startswith("team_pay_self:"):
+            try:
+                entry_id = int(data.split(":")[1])
+                await bot.answer_callback_query(callback_query["id"])
+                
+                payment_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
+                
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Оплатить", url=payment_link)
+                    ]
+                ])
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Оплата за себя (50% стоимости):",
+                    reply_markup=keyboard
+                )
+                return {"ok": True}
+            except Exception as e:
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                return {"ok": True}
+        
+        # Team pay pair: team_pay_pair:{entry_id}
+        if data.startswith("team_pay_pair:"):
+            try:
+                payer_entry_id = int(data.split(":")[1])
+                await bot.answer_callback_query(callback_query["id"])
+                
+                # Get tournament and find pending partners
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get tournament_id and check payer status
+                cur.execute("""
+                    SELECT e.tournament_id, e.payment_status, t.tournament_type
+                    FROM entries e
+                    JOIN tournaments t ON e.tournament_id = t.id
+                    WHERE e.id = %s
+                """, (payer_entry_id,))
+                payer_row = cur.fetchone()
+                
+                if not payer_row:
+                    cur.close()
+                    conn.close()
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: запись не найдена.")
+                    return {"ok": True}
+                
+                tournament_id, payer_status, tournament_type = payer_row
+                
+                if tournament_type != 'team':
+                    cur.close()
+                    conn.close()
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: это не командный турнир.")
+                    return {"ok": True}
+                
+                if payer_status != 'pending':
+                    cur.close()
+                    conn.close()
+                    await bot.send_message(chat_id=chat_id, text="Один из игроков уже оплатил. Используйте оплату за себя.")
+                    return {"ok": True}
+                
+                # Find pending partners (excluding payer)
+                cur.execute("""
+                    SELECT e.id, p.full_name
+                    FROM entries e
+                    JOIN players p ON e.player_id = p.id
+                    WHERE e.tournament_id = %s
+                      AND e.id != %s
+                      AND e.payment_status = 'pending'
+                    ORDER BY p.full_name
+                """, (tournament_id, payer_entry_id))
+                partners = cur.fetchall()
+                
+                cur.close()
+                conn.close()
+                
+                if not partners:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Нет доступных партнеров для оплаты. Все участники уже оплатили или запись не найдена."
+                    )
+                    return {"ok": True}
+                
+                # Create inline buttons for each partner
+                buttons = []
+                for partner_entry_id, partner_name in partners:
+                    buttons.append([
+                        InlineKeyboardButton(
+                            partner_name,
+                            callback_data=f"team_pay_partner:{payer_entry_id}:{partner_entry_id}"
+                        )
+                    ])
+                
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="За кого вы хотите оплатить?",
+                    reply_markup=keyboard
+                )
+                return {"ok": True}
+            except Exception as e:
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                return {"ok": True}
+        
+        # Team pay partner: team_pay_partner:{payer_entry_id}:{partner_entry_id}
+        if data.startswith("team_pay_partner:"):
+            try:
+                parts = data.split(":")
+                payer_entry_id = int(parts[1])
+                partner_entry_id = int(parts[2])
+                await bot.answer_callback_query(callback_query["id"])
+                
+                payment_link = f"{PUBLIC_BASE_URL}/p/team?payer_entry_id={payer_entry_id}&partner_entry_id={partner_entry_id}"
+                
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("Оплатить за пару", url=payment_link)
+                    ]
+                ])
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Оплата за пару (100% стоимости):",
+                    reply_markup=keyboard
+                )
+                return {"ok": True}
+            except Exception as e:
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                return {"ok": True}
 
     return {"ok": True}
 
@@ -1323,6 +1713,8 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
           t.title,
           t.starts_at,
           t.price_rub,
+          t.tournament_type,
+          t.location,
           p.full_name,
           p.telegram_id
         from entries e
@@ -1340,7 +1732,7 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
     processed = 0
     notified = 0
 
-    for (entry_id, title, starts_at, price_rub, full_name, telegram_id) in rows:
+    for (entry_id, title, starts_at, price_rub, tournament_type, location, full_name, telegram_id) in rows:
         print("PROCESS ENTRY", entry_id)
         
         # Вычисляем expires_at
@@ -1401,19 +1793,57 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 chat_id = int(telegram_id)
                 print("TG SEND", telegram_id)
 
+                # Format starts_at in MSK
+                if starts_at:
+                    if isinstance(starts_at, datetime):
+                        if starts_at.tzinfo is None:
+                            starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                        else:
+                            starts_at_utc = starts_at.astimezone(timezone.utc)
+                        starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
+                    else:
+                        starts_at_str = str(starts_at)
+                else:
+                    starts_at_str = "Не указано"
+                
                 # Используем вечную ссылку вместо прямого payment_url
                 permanent_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
                 
-                msg = (
-                    "🎾 Ты записан на турнир!\n\n"
-                    f"🏷️ {title}\n"
-                    f"🕒 {starts_at}\n"
-                    f"💳 {price_rub} ₽\n\n"
-                    f"Оплата по ссылке:\n{permanent_link}"
-                )
-
-                # Вызываем асинхронную функцию
-                await bot.send_message(chat_id=chat_id, text=msg)
+                # Формируем сообщение в зависимости от типа турнира
+                if tournament_type == 'team':
+                    # Team tournament - не указываем сумму, показываем кнопку "Оплатить"
+                    msg = (
+                        "🎾 Ты записан на турнир!\n\n"
+                        f"🏷️ {title}\n"
+                        f"🕒 {starts_at_str}\n"
+                    )
+                    
+                    # Создаем inline keyboard с выбором оплаты
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("Оплатить", callback_data=f"team_pay_choice:{entry_id}")
+                        ]
+                    ])
+                    
+                    await bot.send_message(chat_id=chat_id, text=msg, reply_markup=keyboard)
+                else:
+                    # Personal tournament - показываем сумму и кнопку "Оплатить"
+                    msg = (
+                        "🎾 Ты записан на турнир!\n\n"
+                        f"🏷️ {title}\n"
+                        f"🕒 {starts_at_str}\n"
+                        f"💳 {price_rub} ₽\n\n"
+                    )
+                    
+                    # Создаем inline keyboard с кнопкой "Оплатить"
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("Оплатить", url=permanent_link)
+                        ]
+                    ])
+                    
+                    await bot.send_message(chat_id=chat_id, text=msg, reply_markup=keyboard)
 
                 # Обновляем telegram_notified после успешной отправки
                 cur.execute("""
