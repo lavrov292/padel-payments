@@ -21,6 +21,77 @@ BOT_TZ = pytz.timezone(os.getenv("BOT_TZ", "Europe/Moscow"))
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
+
+# SQL миграция для Supabase (если таблицы telegram_sessions нет или нет поля support_mode):
+# 
+# ALTER TABLE telegram_sessions ADD COLUMN IF NOT EXISTS support_mode BOOLEAN NOT NULL DEFAULT false;
+# ALTER TABLE telegram_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+#
+# Или если таблицы нет вообще:
+# CREATE TABLE IF NOT EXISTS telegram_sessions (
+#     telegram_id TEXT PRIMARY KEY,
+#     state TEXT,
+#     temp_name TEXT,
+#     support_mode BOOLEAN NOT NULL DEFAULT false,
+#     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+# );
+
+def get_db_conn():
+    """Get database connection."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise Exception("DATABASE_URL not set")
+    return psycopg2.connect(database_url, sslmode="require")
+
+def tg_id_str(from_user):
+    """Extract telegram_id from from_user and convert to string."""
+    if from_user and from_user.get("id"):
+        return str(from_user["id"])
+    return None
+
+def set_support_mode(telegram_id, enabled):
+    """Set support_mode for telegram_id."""
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO telegram_sessions (telegram_id, support_mode, updated_at)
+            VALUES (%s::text, %s, NOW())
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET support_mode = %s, updated_at = NOW()
+        """, (telegram_id, enabled, enabled))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_support_mode(telegram_id):
+    """Get support_mode for telegram_id. Returns False if not found."""
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT support_mode FROM telegram_sessions
+            WHERE telegram_id = %s::text
+        """, (telegram_id,))
+        row = cur.fetchone()
+        return row[0] if row else False
+    finally:
+        conn.close()
+
+def get_player_by_tg(telegram_id):
+    """Get player by telegram_id. Returns (id, full_name) or None."""
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, full_name FROM players
+            WHERE telegram_id = %s::text
+        """, (telegram_id,))
+        row = cur.fetchone()
+        return row if row else None
+    finally:
+        conn.close()
+
 # Configure YooKassa
 shop_id = os.getenv("YOOKASSA_SHOP_ID")
 secret_key = os.getenv("YOOKASSA_SECRET_KEY")
@@ -839,6 +910,60 @@ async def telegram_webhook(request: Request):
                 )
             return {"ok": True}
 
+        # Check support_mode BEFORE other handlers (except /start, /whoami, /pay, buttons)
+        telegram_user_id = tg_id_str(from_user)
+        if telegram_user_id:
+            try:
+                support_mode = get_support_mode(telegram_user_id)
+                if support_mode and text not in ["Мои турниры", "Помощь"] and not text.startswith("/start") and not text.startswith("/pay") and not text.startswith("/whoami"):
+                    # User is in support mode, process help request
+                    admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+                    
+                    if not admin_chat_id:
+                        print("WARNING: ADMIN_CHAT_ID not set, support mode unavailable")
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="Сервис помощи временно недоступен."
+                        )
+                        set_support_mode(telegram_user_id, False)
+                        return {"ok": True}
+                    
+                    # Get player info
+                    player_info = get_player_by_tg(telegram_user_id)
+                    player_name = player_info[1] if player_info else "не найден в базе"
+                    
+                    # Get username
+                    username = from_user.get("username") if from_user else None
+                    username_str = f"@{username}" if username else "—"
+                    
+                    # Form admin message
+                    admin_message = f"""🆘 Help request
+
+Player: {player_name}
+TG: {username_str}
+chat_id: {telegram_user_id}
+Text: {text}"""
+                    
+                    # Send to admin
+                    if bot:
+                        try:
+                            await bot.send_message(chat_id=admin_chat_id, text=admin_message)
+                        except Exception as e:
+                            print(f"ERROR sending to admin: {str(e)}")
+                    
+                    # Reset support mode
+                    set_support_mode(telegram_user_id, False)
+                    
+                    # Reply to user
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Принято! Спасибо. Мы разберёмся."
+                    )
+                    return {"ok": True}
+            except Exception as e:
+                print(f"ERROR in support_mode check: {str(e)}")
+                # Continue with normal processing if error
+
         # Handle text messages when session state is "awaiting_lunda_name"
         # Skip if it's a known button or command
         if text not in ["Мои турниры", "Помощь"] and not text.startswith("/"):
@@ -1077,6 +1202,30 @@ Username: {username_str}
                 await bot.send_message(
                     chat_id=chat_id,
                     text=f"Ошибка при получении турниров: {str(e)}"
+                )
+                return {"ok": True}
+
+        # "Помощь" button
+        if text == "Помощь":
+            telegram_user_id = tg_id_str(from_user)
+            if not telegram_user_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка: не удалось определить ваш Telegram ID."
+                )
+                return {"ok": True}
+            
+            try:
+                set_support_mode(telegram_user_id, True)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Опиши проблему одним сообщением. Я отправлю её администратору."
+                )
+                return {"ok": True}
+            except Exception as e:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ошибка: {str(e)}"
                 )
                 return {"ok": True}
 
