@@ -10,6 +10,8 @@ type Tournament = {
   starts_at: string;
   price_rub: number;
   tournament_type: string;
+  active: boolean;
+  archived_at: string | null;
   entries_total: number;
   entries_paid: number;
   entries_pending: number;
@@ -28,27 +30,72 @@ export default function AdminPage() {
   const [errorText, setErrorText] = useState<string | null>(null);
   const [copiedEntryId, setCopiedEntryId] = useState<string | number | null>(null);
   const [showPast, setShowPast] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
 
   useEffect(() => {
     async function load() {
       setLoading(true);
       setErrorText(null);
 
-      const { data, error } = await supabase
-        .from("admin_tournaments_view")
-        .select("*");
+      // Load tournaments - query tournaments table directly to get both active and archived
+      const { data: tournamentsData, error: tournamentsError } = await supabase
+        .from("tournaments")
+        .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, last_seen_in_source")
+        .order("starts_at", { ascending: true });
+      
+      if (tournamentsError) {
+        setErrorText(tournamentsError.message);
+        setLoading(false);
+        return;
+      }
+      
+      // Load entries separately to count paid/pending
+      const { data: entriesData, error: entriesError } = await supabase
+        .from("entries")
+        .select("tournament_id, payment_status");
+      
+      if (entriesError) {
+        console.error("Error loading entries:", entriesError);
+      }
+      
+      // Process data
+      const entriesByTournament = new Map<number, any[]>();
+      if (entriesData) {
+        entriesData.forEach((entry: any) => {
+          const tid = entry.tournament_id;
+          if (!entriesByTournament.has(tid)) {
+            entriesByTournament.set(tid, []);
+          }
+          entriesByTournament.get(tid)!.push(entry);
+        });
+      }
+      
+      const processed = (tournamentsData || []).map((t: any) => {
+        const entries = entriesByTournament.get(t.id) || [];
+        const paid = entries.filter((e: any) => e.payment_status === 'paid').length;
+        const pending = entries.filter((e: any) => e.payment_status === 'pending').length;
+        
+        return {
+          tournament_id: t.id,
+          title: t.title,
+          starts_at: t.starts_at,
+          price_rub: t.price_rub,
+          tournament_type: t.tournament_type || 'personal',
+          active: t.active !== false,
+          archived_at: t.archived_at,
+          entries_total: entries.length,
+          entries_paid: paid,
+          entries_pending: pending
+        } as Tournament;
+      });
+      
+      const error = entriesError ? entriesError.message : null;
 
       if (error) {
         console.error(error);
-        setErrorText(`${error.message}`);
+        setErrorText(error);
       } else {
-        // Sort by starts_at ASC
-        const sorted = ((data as Tournament[]) || []).sort((a, b) => {
-          const dateA = new Date(a.starts_at).getTime();
-          const dateB = new Date(b.starts_at).getTime();
-          return dateA - dateB;
-        });
-        setData(sorted);
+        setData(processed);
       }
 
       setLoading(false);
@@ -72,14 +119,24 @@ export default function AdminPage() {
     );
   }
 
-  // Filter past tournaments
+  // Filter tournaments
   const now = new Date();
-  const filteredData = showPast 
-    ? data 
-    : data.filter((t) => {
-        const tournamentDate = new Date(t.starts_at);
-        return tournamentDate >= now;
-      });
+  const filteredData = data.filter((t) => {
+    // Filter by active/archived
+    if (!showArchived && !t.active) {
+      return false;
+    }
+    
+    // Filter by past
+    if (!showPast) {
+      const tournamentDate = new Date(t.starts_at);
+      if (tournamentDate < now) {
+        return false;
+      }
+    }
+    
+    return true;
+  });
 
   // Format date in MSK
   const formatMSK = (dateStr: string) => {
@@ -97,15 +154,26 @@ export default function AdminPage() {
     <div className="p-6 bg-gray-900 min-h-screen">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-white">Турниры</h1>
-        <label className="flex items-center gap-2 text-white cursor-pointer">
-          <input
-            type="checkbox"
-            checked={showPast}
-            onChange={(e) => setShowPast(e.target.checked)}
-            className="w-4 h-4"
-          />
-          <span>Показать прошедшие</span>
-        </label>
+        <div className="flex items-center gap-4">
+          <label className="flex items-center gap-2 text-white cursor-pointer">
+            <input
+              type="checkbox"
+              checked={showPast}
+              onChange={(e) => setShowPast(e.target.checked)}
+              className="w-4 h-4"
+            />
+            <span>Показать прошедшие</span>
+          </label>
+          <label className="flex items-center gap-2 text-white cursor-pointer">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+              className="w-4 h-4"
+            />
+            <span>Показать архив</span>
+          </label>
+        </div>
       </div>
       <table className="border border-gray-500 w-full text-sm">
         <thead>
@@ -148,7 +216,14 @@ export default function AdminPage() {
           setOpenTournamentId(t.tournament_id);
         }}
       >
-        <td className="border border-gray-500 px-2 py-1">{t.title}</td>
+        <td className="border border-gray-500 px-2 py-1">
+          {t.title}
+          {!t.active && (
+            <span className="ml-2 px-1.5 py-0.5 text-xs bg-gray-500 text-white rounded">
+              Архив
+            </span>
+          )}
+        </td>
         <td className="border border-gray-500 px-2 py-1">
           {formatMSK(t.starts_at)}
         </td>
