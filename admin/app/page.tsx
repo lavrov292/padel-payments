@@ -26,7 +26,7 @@ export default function AdminPage() {
   const [data, setData] = useState<Tournament[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorText, setErrorText] = useState<string | null>(null);
-  const [copiedEntryId, setCopiedEntryId] = useState<number | null>(null);
+  const [copiedEntryId, setCopiedEntryId] = useState<string | number | null>(null);
   const [showPast, setShowPast] = useState(false);
 
   useEffect(() => {
@@ -271,7 +271,7 @@ export default function AdminPage() {
                                 >
                                   Ссылка
                                 </button>
-                                {copiedEntryId === e.entry_id && (
+                                {copiedEntryId === String(e.entry_id) && (
                                   <span className="text-xs text-green-400">Скопировано!</span>
                                 )}
                               </>
