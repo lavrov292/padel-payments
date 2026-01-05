@@ -252,7 +252,7 @@ def payment_entry_link(entry_id: int):
             "expires_at": expires_at_str
         }
         
-        print(f"PAYMENT CREATE PAYLOAD: entry_id={entry_id}, payload={payment_data}")
+        print(f"PAYMENT CREATE PAYLOAD: entry_id={entry_id}, tournament_type={tournament_type}, amount={payment_amount:.2f}, payload={payment_data}")
         payment = Payment.create(payment_data, idempotence_key)
         
         new_payment_id = payment.id
@@ -1699,14 +1699,19 @@ from datetime import datetime
 @app.post("/admin/process-new-entries")
 async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
     """
-    Находит entries, которым нужно создать ссылку оплаты, и создает платежи.
+    Находит entries, которым нужно создать вечную ссылку на оплату.
+    НЕ создает YooKassa payments массово - только сохраняет вечные ссылки.
     Если у игрока есть telegram_id — отправляет сообщение.
     limit — защита от массовых ошибочных созданий.
     """
+    public_base_url = os.getenv("PUBLIC_BASE_URL")
+    if not public_base_url:
+        return {"ok": False, "error": "PUBLIC_BASE_URL not set. Please set it in environment variables."}
+    
     conn = get_db()
     cur = conn.cursor()
 
-    # Выбираем entries, которым нужно создать ссылку
+    # Выбираем entries, которым нужно создать вечную ссылку
     cur.execute("""
         select
           e.id as entry_id,
@@ -1735,55 +1740,15 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
     for (entry_id, title, starts_at, price_rub, tournament_type, location, full_name, telegram_id) in rows:
         print("PROCESS ENTRY", entry_id)
         
-        # Вычисляем expires_at
-        now_utc = datetime.now(timezone.utc)
-        if starts_at:
-            # Конвертируем starts_at в UTC datetime
-            if isinstance(starts_at, datetime):
-                if starts_at.tzinfo is None:
-                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
-                else:
-                    starts_at_utc = starts_at.astimezone(timezone.utc)
-                
-                # Если starts_at в будущем: expires_at = starts_at + 3 часа
-                if starts_at_utc > now_utc:
-                    expires_at = starts_at_utc + timedelta(hours=3)
-                else:
-                    # Если starts_at в прошлом: expires_at = now + 24 часа
-                    expires_at = now_utc + timedelta(hours=24)
-            else:
-                # Если starts_at не datetime, используем now + 24 часа
-                expires_at = now_utc + timedelta(hours=24)
-        else:
-            # Если starts_at NULL: expires_at = now + 24 часа
-            expires_at = now_utc + timedelta(hours=24)
-        
-        # Преобразуем в ISO8601 UTC строку
-        expires_at_str = expires_at.isoformat().replace('+00:00', 'Z')
-        
-        # создаем платеж
-        payment = Payment.create({
-            "amount": {"value": f"{float(price_rub):.2f}", "currency": "RUB"},
-            "confirmation": {
-                "type": "redirect",
-                "return_url": "https://example.com/paid"
-            },
-            "capture": True,
-            "description": f"Padel tournament: {title}",
-            "metadata": {"entry_id": str(entry_id), "player": full_name},
-            "expires_at": expires_at_str
-        })
+        # Создаем вечную ссылку вместо YooKassa payment
+        permanent_link = f"{public_base_url}/p/e/{entry_id}"
 
-        payment_url = payment.confirmation.confirmation_url
-        payment_id_new = payment.id
-
-        # Записываем payment_id и payment_url в entries
+        # Записываем вечную ссылку в entries (payment_id и payment_url остаются NULL до реальной оплаты)
         cur.execute("""
             update entries
-            set payment_id = %s,
-                payment_url = %s
+            set payment_url = %s
             where id = %s
-        """, (payment_id_new, payment_url, entry_id))
+        """, (permanent_link, entry_id))
         conn.commit()
         processed += 1
 
@@ -1807,8 +1772,8 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 else:
                     starts_at_str = "Не указано"
                 
-                # Используем вечную ссылку вместо прямого payment_url
-                permanent_link = f"{PUBLIC_BASE_URL}/p/e/{entry_id}"
+                # Используем вечную ссылку
+                permanent_link = f"{public_base_url}/p/e/{entry_id}"
                 
                 # Формируем сообщение в зависимости от типа турнира
                 if tournament_type == 'team':

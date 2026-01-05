@@ -50,19 +50,28 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
     price_rub = parse_price(tournament_info.get('price', ''))
     source_last_updated = tournament_data.get('last_updated') or global_last_updated
     
+    # Get tournament_type from tournament_data (not from nested tournament object)
+    tournament_type = tournament_data.get('tournament_type', '').lower()
+    if tournament_type not in ['personal', 'team']:
+        tournament_type = 'personal'  # Default to personal if not specified or invalid
+    
+    # Log tournament import
+    print(f"IMPORT TOURNAMENT: title={title}, location={location}, starts_at={starts_at}, type={tournament_type}")
+    
     # UPSERT tournament
     cur.execute("""
-        INSERT INTO tournaments (location, starts_at, ends_at, organizer, title, price_rub, source_last_updated)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO tournaments (location, starts_at, ends_at, organizer, title, price_rub, source_last_updated, tournament_type)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (location, starts_at)
         DO UPDATE SET
             ends_at = EXCLUDED.ends_at,
             organizer = EXCLUDED.organizer,
             title = EXCLUDED.title,
             price_rub = EXCLUDED.price_rub,
-            source_last_updated = EXCLUDED.source_last_updated
+            source_last_updated = EXCLUDED.source_last_updated,
+            tournament_type = EXCLUDED.tournament_type
         RETURNING id
-    """, (location, starts_at, ends_at, organizer, title, price_rub, source_last_updated))
+    """, (location, starts_at, ends_at, organizer, title, price_rub, source_last_updated, tournament_type))
     
     tournament_id = cur.fetchone()[0]
     conn.commit()

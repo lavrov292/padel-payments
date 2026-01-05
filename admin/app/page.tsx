@@ -109,7 +109,14 @@ export default function AdminPage() {
       >
         <td className="border border-gray-500 px-2 py-1">{t.title}</td>
         <td className="border border-gray-500 px-2 py-1">
-          {new Date(t.starts_at).toLocaleString()}
+          {new Date(t.starts_at).toLocaleString('ru-RU', {
+            timeZone: 'Europe/Moscow',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit'
+          })}
         </td>
         <td className="border border-gray-500 px-2 py-1">{t.price_rub} ₽</td>
         <td className="border border-gray-500 px-2 py-1 text-center">{t.entries_total}</td>
@@ -127,7 +134,9 @@ export default function AdminPage() {
                 <tr className="bg-black text-white text-left">
                   <th className="border border-gray-500 py-1 px-2">Игрок</th>
                   <th className="border border-gray-500 py-1 px-2">Статус</th>
+                  <th className="border border-gray-500 py-1 px-2">Тип</th>
                   <th className="border border-gray-500 py-1 px-2">Уведомление</th>
+                  <th className="border border-gray-500 py-1 px-2">Обновлено</th>
                   <th className="border border-gray-500 py-1 px-2">Ссылка</th>
                 </tr>
               </thead>
@@ -144,6 +153,15 @@ export default function AdminPage() {
                       )}
                     </td>
                     <td className="py-1 px-2 border border-gray-500">
+                      <span className={`px-1.5 py-0.5 text-xs rounded ${
+                        e.tournament_type === 'team' 
+                          ? 'bg-blue-500 text-white' 
+                          : 'bg-gray-600 text-white'
+                      }`}>
+                        {e.tournament_type || 'personal'}
+                      </span>
+                    </td>
+                    <td className="py-1 px-2 border border-gray-500">
                       {e.telegram_id ? (
                         e.telegram_notified ? (
                           <span className="text-green-400">✅ Отправлено</span>
@@ -152,6 +170,20 @@ export default function AdminPage() {
                         )
                       ) : (
                         <span className="text-gray-400">— Нет Telegram</span>
+                      )}
+                    </td>
+                    <td className="py-1 px-2 border border-gray-500 text-xs">
+                      {e.source_last_updated ? (
+                        new Date(e.source_last_updated).toLocaleString('ru-RU', {
+                          timeZone: 'Europe/Moscow',
+                          year: 'numeric',
+                          month: '2-digit',
+                          day: '2-digit',
+                          hour: '2-digit',
+                          minute: '2-digit'
+                        })
+                      ) : (
+                        <span className="text-gray-400">—</span>
                       )}
                     </td>
                     <td className="py-1 px-2 border border-gray-500">
@@ -224,7 +256,7 @@ export default function AdminPage() {
 
                 {entries.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="py-2 px-2 border border-gray-500 text-gray-400">
+                    <td colSpan={6} className="py-2 px-2 border border-gray-500 text-gray-400">
                       Нет записей
                     </td>
                   </tr>
