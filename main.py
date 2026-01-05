@@ -1877,6 +1877,7 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
           e.payment_status,
           e.telegram_notified,
           e.payment_url,
+          e.active,
           t.title,
           t.starts_at,
           t.price_rub,
@@ -1897,14 +1898,15 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
     rows = cur.fetchall()
 
     # 2. После SQL выборки
-    print(f"selected_rows={len(rows)}")
+    print(f"SELECT count={len(rows)}")
 
     processed = 0
     notified = 0
+    details = []
 
-    for (entry_id, player_id, payment_status, telegram_notified, payment_url, title, starts_at, price_rub, tournament_type, location, full_name, telegram_id) in rows:
+    for (entry_id, player_id, payment_status, telegram_notified, payment_url, active, title, starts_at, price_rub, tournament_type, location, full_name, telegram_id) in rows:
         # 3. В цикле для каждой записи - одна строка лога
-        print(f"ENTRY: entry_id={entry_id}, player_id={player_id}, telegram_id={telegram_id}, payment_status={payment_status}, telegram_notified={telegram_notified}, payment_url={payment_url}")
+        print(f"ENTRY: entry_id={entry_id}, player_id={player_id}, telegram_id={telegram_id}, payment_status={payment_status}, telegram_notified={telegram_notified}, active={active}, payment_url={payment_url}")
         
         # Создаем вечную ссылку вместо YooKassa payment
         # Для team турниров по умолчанию 50%, для personal - 100%
@@ -1922,19 +1924,39 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
         conn.commit()
         processed += 1
 
-        # уведомление в телеграм (если есть telegram_id)
-        # 7. Проверка случаев пропуска
-        if bot is None:
-            print(f"TG SKIP: reason=bot is None, entry_id={entry_id}")
+        # Инициализируем детали для этой entry
+        entry_detail = {
+            "entry_id": entry_id,
+            "player_id": player_id,
+            "telegram_id": str(telegram_id) if telegram_id else None,
+            "status": None,
+            "reason": None,
+            "payment_url": permanent_link
+        }
+
+        # Определяем статус уведомления
+        # Проверка случаев пропуска
+        if not active:
+            entry_detail["status"] = "skipped"
+            entry_detail["reason"] = "inactive"
+            print(f"ENTRY {entry_id}: action=skipped, reason=inactive")
         elif not telegram_id:
-            print(f"TG SKIP: reason=telegram_id is empty, entry_id={entry_id}")
+            entry_detail["status"] = "skipped"
+            entry_detail["reason"] = "no_telegram_id"
+            print(f"ENTRY {entry_id}: action=skipped, reason=no_telegram_id")
         elif telegram_notified:
-            print(f"TG SKIP: reason=telegram_notified already true, entry_id={entry_id}")
-        elif telegram_id and bot is not None:
+            entry_detail["status"] = "skipped"
+            entry_detail["reason"] = "already_notified"
+            print(f"ENTRY {entry_id}: action=skipped, reason=already_notified")
+        elif bot is None or not bot_token_present:
+            entry_detail["status"] = "error"
+            entry_detail["reason"] = "bot_not_configured"
+            print(f"ENTRY {entry_id}: action=error, reason=bot_not_configured")
+        else:
+            # Пытаемся отправить уведомление
             try:
                 chat_id = int(telegram_id)
-                # 4. Прямо перед отправкой
-                print(f"TG SEND -> chat_id={chat_id}, entry_id={entry_id}")
+                print(f"ENTRY {entry_id}: action=send, telegram_id={telegram_id}")
 
                 # Format starts_at in MSK
                 if starts_at:
@@ -2002,13 +2024,27 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 conn.commit()
 
                 # 5. После успешной отправки
-                print("TG OK")
+                entry_detail["status"] = "sent"
+                entry_detail["reason"] = None
+                print(f"ENTRY {entry_id}: action=sent")
                 notified += 1
             except Exception as e:
-                # 6. Полный traceback в except
+                # 6. Сохраняем ошибку в детали
+                error_msg = str(e)
+                entry_detail["status"] = "error"
+                entry_detail["reason"] = error_msg
+                print(f"ENTRY {entry_id}: action=error, reason={error_msg}")
                 print("TG ERROR:", traceback.format_exc())
+        
+        # Добавляем детали в массив
+        details.append(entry_detail)
 
     cur.close()
     conn.close()
 
-    return {"ok": True, "processed": processed, "notified": notified}
+    return {
+        "ok": True,
+        "processed": processed,
+        "notified": notified,
+        "details": details
+    }
