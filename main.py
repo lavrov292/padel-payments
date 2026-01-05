@@ -132,9 +132,10 @@ def db_check():
         return {"db": "error", "reason": str(e)}
 
 @app.get("/p/e/{entry_id}")
-def payment_entry_link(entry_id: int):
+def payment_entry_link(entry_id: int, pay: str = Query("default", description="Payment mode: 'half' for 50%, 'full' for 100%, 'default' for auto")):
     """
     Вечная ссылка на оплату entry. Проверяет статус платежа и создает новый при необходимости.
+    Query param 'pay': 'half' (50%), 'full' (100%), 'default' (auto based on tournament_type)
     """
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
@@ -203,15 +204,25 @@ def payment_entry_link(entry_id: int):
                 payment_id = None
         
         # Если платеж невалиден или payment_id пустой - создаем новый
-        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}")
+        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}")
         
-        # Calculate payment amount based on tournament type
+        # Calculate payment amount based on tournament type and pay parameter
         if tournament_type == 'team':
-            # Team tournament: 50% of price
-            payment_amount = price_rub / 2
+            if pay == 'full':
+                # Team tournament: 100% (full pair payment)
+                payment_amount = float(price_rub)
+            elif pay == 'half':
+                # Team tournament: 50% (single person payment)
+                payment_amount = float(price_rub) / 2
+            else:
+                # Default for team: 50%
+                payment_amount = float(price_rub) / 2
         else:
-            # Personal tournament: full price
-            payment_amount = price_rub
+            # Personal tournament: always 100%
+            payment_amount = float(price_rub)
+        
+        # Round to 2 decimal places (YooKassa requires .2f format)
+        payment_amount = round(payment_amount, 2)
         
         # Calculate expires_at
         now_utc = datetime.now(timezone.utc)
@@ -1741,7 +1752,11 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
         print("PROCESS ENTRY", entry_id)
         
         # Создаем вечную ссылку вместо YooKassa payment
-        permanent_link = f"{public_base_url}/p/e/{entry_id}"
+        # Для team турниров по умолчанию 50%, для personal - 100%
+        if tournament_type == 'team':
+            permanent_link = f"{public_base_url}/p/e/{entry_id}?pay=half"
+        else:
+            permanent_link = f"{public_base_url}/p/e/{entry_id}"
 
         # Записываем вечную ссылку в entries (payment_id и payment_url остаются NULL до реальной оплаты)
         cur.execute("""
@@ -1766,14 +1781,18 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                         else:
                             starts_at_utc = starts_at.astimezone(timezone.utc)
                         starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
-                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M МСК")
                     else:
                         starts_at_str = str(starts_at)
                 else:
                     starts_at_str = "Не указано"
                 
                 # Используем вечную ссылку
-                permanent_link = f"{public_base_url}/p/e/{entry_id}"
+                # Для team турниров по умолчанию 50%, для personal - 100%
+                if tournament_type == 'team':
+                    permanent_link = f"{public_base_url}/p/e/{entry_id}?pay=half"
+                else:
+                    permanent_link = f"{public_base_url}/p/e/{entry_id}"
                 
                 # Формируем сообщение в зависимости от типа турнира
                 if tournament_type == 'team':

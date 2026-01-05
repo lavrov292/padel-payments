@@ -9,6 +9,7 @@ type Tournament = {
   title: string;
   starts_at: string;
   price_rub: number;
+  tournament_type: string;
   entries_total: number;
   entries_paid: number;
   entries_pending: number;
@@ -26,6 +27,7 @@ export default function AdminPage() {
   const [loading, setLoading] = useState(true);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [copiedEntryId, setCopiedEntryId] = useState<number | null>(null);
+  const [showPast, setShowPast] = useState(false);
 
   useEffect(() => {
     async function load() {
@@ -40,7 +42,13 @@ export default function AdminPage() {
         console.error(error);
         setErrorText(`${error.message}`);
       } else {
-        setData((data as Tournament[]) || []);
+        // Sort by starts_at ASC
+        const sorted = ((data as Tournament[]) || []).sort((a, b) => {
+          const dateA = new Date(a.starts_at).getTime();
+          const dateB = new Date(b.starts_at).getTime();
+          return dateA - dateB;
+        });
+        setData(sorted);
       }
 
       setLoading(false);
@@ -64,14 +72,47 @@ export default function AdminPage() {
     );
   }
 
+  // Filter past tournaments
+  const now = new Date();
+  const filteredData = showPast 
+    ? data 
+    : data.filter((t) => {
+        const tournamentDate = new Date(t.starts_at);
+        return tournamentDate >= now;
+      });
+
+  // Format date in MSK
+  const formatMSK = (dateStr: string) => {
+    return new Date(dateStr).toLocaleString('ru-RU', {
+      timeZone: 'Europe/Moscow',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
   return (
     <div className="p-6 bg-gray-900 min-h-screen">
-      <h1 className="text-2xl font-bold mb-6 text-white">Турниры</h1>
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold text-white">Турниры</h1>
+        <label className="flex items-center gap-2 text-white cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showPast}
+            onChange={(e) => setShowPast(e.target.checked)}
+            className="w-4 h-4"
+          />
+          <span>Показать прошедшие</span>
+        </label>
+      </div>
       <table className="border border-gray-500 w-full text-sm">
         <thead>
           <tr className="bg-black text-white">
             <th className="border border-gray-500 px-2 py-1 text-left">Турнир</th>
             <th className="border border-gray-500 px-2 py-1 text-left">Дата</th>
+            <th className="border border-gray-500 px-2 py-1 text-left">Тип</th>
             <th className="border border-gray-500 px-2 py-1 text-left">Цена</th>
             <th className="border border-gray-500 px-2 py-1">Всего</th>
             <th className="border border-gray-500 px-2 py-1">Оплачено</th>
@@ -80,7 +121,7 @@ export default function AdminPage() {
         </thead>
 
         <tbody>
-  {data.map((t) => (
+  {filteredData.map((t) => (
     <React.Fragment key={t.tournament_id}>
       <tr
         key={t.tournament_id}
@@ -109,14 +150,16 @@ export default function AdminPage() {
       >
         <td className="border border-gray-500 px-2 py-1">{t.title}</td>
         <td className="border border-gray-500 px-2 py-1">
-          {new Date(t.starts_at).toLocaleString('ru-RU', {
-            timeZone: 'Europe/Moscow',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit'
-          })}
+          {formatMSK(t.starts_at)}
+        </td>
+        <td className="border border-gray-500 px-2 py-1">
+          <span className={`px-1.5 py-0.5 text-xs rounded ${
+            t.tournament_type === 'team' 
+              ? 'bg-blue-500 text-white' 
+              : 'bg-gray-600 text-white'
+          }`}>
+            {t.tournament_type === 'team' ? 'Парный' : 'Личный'}
+          </span>
         </td>
         <td className="border border-gray-500 px-2 py-1">{t.price_rub} ₽</td>
         <td className="border border-gray-500 px-2 py-1 text-center">{t.entries_total}</td>
@@ -126,7 +169,7 @@ export default function AdminPage() {
 
       {openTournamentId === t.tournament_id && (
         <tr key={`details-${t.tournament_id}`}>
-          <td colSpan={6} className="border border-gray-500 px-2 py-3 bg-gray-800 text-white">
+          <td colSpan={7} className="border border-gray-500 px-2 py-3 bg-gray-800 text-white">
             <div className="font-semibold mb-2">Участники</div>
 
             <table className="w-full text-sm">
@@ -134,7 +177,6 @@ export default function AdminPage() {
                 <tr className="bg-black text-white text-left">
                   <th className="border border-gray-500 py-1 px-2">Игрок</th>
                   <th className="border border-gray-500 py-1 px-2">Статус</th>
-                  <th className="border border-gray-500 py-1 px-2">Тип</th>
                   <th className="border border-gray-500 py-1 px-2">Уведомление</th>
                   <th className="border border-gray-500 py-1 px-2">Обновлено</th>
                   <th className="border border-gray-500 py-1 px-2">Ссылка</th>
@@ -153,15 +195,6 @@ export default function AdminPage() {
                       )}
                     </td>
                     <td className="py-1 px-2 border border-gray-500">
-                      <span className={`px-1.5 py-0.5 text-xs rounded ${
-                        e.tournament_type === 'team' 
-                          ? 'bg-blue-500 text-white' 
-                          : 'bg-gray-600 text-white'
-                      }`}>
-                        {e.tournament_type || 'personal'}
-                      </span>
-                    </td>
-                    <td className="py-1 px-2 border border-gray-500">
                       {e.telegram_id ? (
                         e.telegram_notified ? (
                           <span className="text-green-400">✅ Отправлено</span>
@@ -174,14 +207,7 @@ export default function AdminPage() {
                     </td>
                     <td className="py-1 px-2 border border-gray-500 text-xs">
                       {e.source_last_updated ? (
-                        new Date(e.source_last_updated).toLocaleString('ru-RU', {
-                          timeZone: 'Europe/Moscow',
-                          year: 'numeric',
-                          month: '2-digit',
-                          day: '2-digit',
-                          hour: '2-digit',
-                          minute: '2-digit'
-                        })
+                        formatMSK(e.source_last_updated)
                       ) : (
                         <span className="text-gray-400">—</span>
                       )}
@@ -192,23 +218,63 @@ export default function AdminPage() {
                           <span className="text-green-400 text-xs">Оплачено</span>
                         ) : (
                           <>
-                            <button
-                              className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
-                              onClick={async () => {
-                                try {
-                                  const permanentLink = `${apiBase}/p/e/${e.entry_id}`;
-                                  await navigator.clipboard.writeText(permanentLink);
-                                  setCopiedEntryId(e.entry_id);
-                                  setTimeout(() => setCopiedEntryId(null), 2000);
-                                } catch (err) {
-                                  alert("Не удалось скопировать ссылку");
-                                }
-                              }}
-                            >
-                              Скопировать ссылку
-                            </button>
-                            {copiedEntryId === e.entry_id && (
-                              <span className="text-xs text-green-400">Скопировано!</span>
+                            {e.tournament_type === 'team' ? (
+                              <>
+                                <button
+                                  className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                                  onClick={async () => {
+                                    try {
+                                      const permanentLink = `${apiBase}/p/e/${e.entry_id}?pay=half`;
+                                      await navigator.clipboard.writeText(permanentLink);
+                                      setCopiedEntryId(`${e.entry_id}-half`);
+                                      setTimeout(() => setCopiedEntryId(null), 2000);
+                                    } catch (err) {
+                                      alert("Не удалось скопировать ссылку");
+                                    }
+                                  }}
+                                >
+                                  Ссылка 50%
+                                </button>
+                                <button
+                                  className="px-3 py-1.5 text-xs font-medium bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
+                                  onClick={async () => {
+                                    try {
+                                      const permanentLink = `${apiBase}/p/e/${e.entry_id}?pay=full`;
+                                      await navigator.clipboard.writeText(permanentLink);
+                                      setCopiedEntryId(`${e.entry_id}-full`);
+                                      setTimeout(() => setCopiedEntryId(null), 2000);
+                                    } catch (err) {
+                                      alert("Не удалось скопировать ссылку");
+                                    }
+                                  }}
+                                >
+                                  Ссылка 100%
+                                </button>
+                                {(copiedEntryId === `${e.entry_id}-half` || copiedEntryId === `${e.entry_id}-full`) && (
+                                  <span className="text-xs text-green-400">Скопировано!</span>
+                                )}
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                                  onClick={async () => {
+                                    try {
+                                      const permanentLink = `${apiBase}/p/e/${e.entry_id}`;
+                                      await navigator.clipboard.writeText(permanentLink);
+                                      setCopiedEntryId(e.entry_id);
+                                      setTimeout(() => setCopiedEntryId(null), 2000);
+                                    } catch (err) {
+                                      alert("Не удалось скопировать ссылку");
+                                    }
+                                  }}
+                                >
+                                  Ссылка
+                                </button>
+                                {copiedEntryId === e.entry_id && (
+                                  <span className="text-xs text-green-400">Скопировано!</span>
+                                )}
+                              </>
                             )}
                             {e.payment_status === "pending" && (
                               <button
@@ -256,7 +322,7 @@ export default function AdminPage() {
 
                 {entries.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="py-2 px-2 border border-gray-500 text-gray-400">
+                    <td colSpan={5} className="py-2 px-2 border border-gray-500 text-gray-400">
                       Нет записей
                     </td>
                   </tr>
