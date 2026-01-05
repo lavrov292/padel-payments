@@ -75,6 +75,7 @@ SELECT
     t.source_last_updated,
     t.active,
     t.archived_at,
+    t.first_seen_in_source,
     t.last_seen_in_source,
     COUNT(e.id) AS entries_total,
     COUNT(e.id) FILTER (WHERE e.payment_status = 'paid') AS entries_paid,
@@ -82,9 +83,9 @@ SELECT
 FROM tournaments t
 LEFT JOIN entries e ON e.tournament_id = t.id
 WHERE t.active = true  -- Only show active tournaments by default
-GROUP BY t.id, t.title, t.starts_at, t.price_rub, t.tournament_type, t.source_last_updated, t.active, t.archived_at, t.last_seen_in_source;
+GROUP BY t.id, t.title, t.starts_at, t.price_rub, t.tournament_type, t.source_last_updated, t.active, t.archived_at, t.first_seen_in_source, t.last_seen_in_source;
 
--- C) Update admin_entries_view to include tournament active status
+-- C) Update admin_entries_view to include tournament active status and first_seen_in_source
 DROP VIEW IF EXISTS admin_entries_view;
 
 CREATE VIEW admin_entries_view AS
@@ -100,6 +101,7 @@ SELECT
     e.active AS entry_active,
     e.telegram_notified,
     e.telegram_notified_at,
+    e.first_seen_in_source,
     e.last_seen_in_source,
     p.full_name,
     p.telegram_id,
@@ -112,6 +114,8 @@ SELECT
     t.source_last_updated,
     t.active AS tournament_active,
     t.archived_at,
+    t.first_seen_in_source AS tournament_first_seen_in_source,
+    t.last_seen_in_source AS tournament_last_seen_in_source,
     t.organizer
 FROM entries e
 JOIN players p ON e.player_id = p.id

@@ -692,20 +692,41 @@ async def yookassa_webhook(payload: dict = Body(...)):
     try:
         if payload.get("event") == "payment.succeeded":
             payment_id = payload.get("object", {}).get("id")
+            payment_object = payload.get("object", {})
+            
+            # Get actual payment amount from YooKassa
+            amount_value = None
+            if payment_object.get("amount"):
+                amount_value = payment_object["amount"].get("value")
+                if amount_value:
+                    try:
+                        amount_value = float(amount_value)
+                    except (ValueError, TypeError):
+                        amount_value = None
             
             if payment_id:
                 conn = psycopg2.connect(database_url, sslmode="require")
                 cur = conn.cursor()
                 
-                # Update payment status for all entries with this payment_id
+                # Update payment status and paid_amount_rub for all entries with this payment_id
                 # (может быть один entry для personal или два для team)
-                update_query = """
-                    UPDATE entries
-                    SET payment_status = 'paid', paid_at = NOW()
-                    WHERE payment_id = %s
-                """
+                if amount_value is not None:
+                    update_query = """
+                        UPDATE entries
+                        SET payment_status = 'paid', 
+                            paid_at = NOW(),
+                            paid_amount_rub = %s
+                        WHERE payment_id = %s
+                    """
+                    cur.execute(update_query, (amount_value, payment_id))
+                else:
+                    update_query = """
+                        UPDATE entries
+                        SET payment_status = 'paid', paid_at = NOW()
+                        WHERE payment_id = %s
+                    """
+                    cur.execute(update_query, (payment_id,))
                 
-                cur.execute(update_query, (payment_id,))
                 conn.commit()
                 
                 # Fetch all entries with this payment_id (for team payments there will be 2)
@@ -718,6 +739,7 @@ async def yookassa_webhook(payload: dict = Body(...)):
                         t.price_rub,
                         t.tournament_type,
                         t.location,
+                        e.paid_amount_rub,
                         COUNT(*) OVER (PARTITION BY e.payment_id) as payment_count
                     FROM entries e
                     JOIN players p ON e.player_id = p.id
@@ -734,10 +756,10 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 # Send Telegram notifications to all players whose status became paid
                 if rows and bot is not None:
                     for row in rows:
-                        entry_id, telegram_id, tournament_title, starts_at, price_rub, tournament_type, location, payment_count = row
+                        entry_id, telegram_id, tournament_title, starts_at, price_rub, tournament_type, location, paid_amount_rub, payment_count = row
                         if telegram_id:
                             try:
-                                # Format starts_at in MSK
+                                # Format starts_at (without MSK suffix)
                                 if starts_at:
                                     if isinstance(starts_at, datetime):
                                         if starts_at.tzinfo is None:
@@ -745,11 +767,22 @@ async def yookassa_webhook(payload: dict = Body(...)):
                                         else:
                                             starts_at_utc = starts_at.astimezone(timezone.utc)
                                         starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
-                                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M MSK")
+                                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
                                     else:
                                         starts_at_str = str(starts_at)
                                 else:
                                     starts_at_str = "Не указано"
+                                
+                                # Determine actual payment amount
+                                # Priority: paid_amount_rub > calculated from tournament type
+                                if paid_amount_rub is not None:
+                                    actual_amount = int(paid_amount_rub)
+                                elif tournament_type == 'team' and payment_count == 1:
+                                    # Single team payment (half)
+                                    actual_amount = int(price_rub / 2)
+                                else:
+                                    # Personal or full team payment
+                                    actual_amount = int(price_rub)
                                 
                                 # Check if this is a team payment (2 entries with same payment_id)
                                 if payment_count == 2 and tournament_type == 'team':
@@ -782,7 +815,7 @@ async def yookassa_webhook(payload: dict = Body(...)):
 Турнир: {tournament_title}
 Место: {location or 'Не указано'}
 Время: {starts_at_str}
-Сумма: {price_rub} ₽"""
+Сумма: {actual_amount} ₽"""
                                 
                                 await bot.send_message(chat_id=telegram_id, text=message)
                             except Exception as telegram_error:
@@ -1098,7 +1131,7 @@ def get_partners_for_tournament(tournament_id: int, exclude_player_id: int):
         conn.close()
 
 def format_dt_msk(dt):
-    """Format datetime in MSK timezone: DD.MM.YYYY HH:MM МСК"""
+    """Format datetime in MSK timezone: DD.MM.YYYY HH:MM (without MSK suffix)"""
     if not dt:
         return "Не указано"
     
@@ -1108,7 +1141,7 @@ def format_dt_msk(dt):
         else:
             dt_utc = dt.astimezone(timezone.utc)
         dt_msk = dt_utc.astimezone(BOT_TZ)
-        return dt_msk.strftime("%d.%m.%Y %H:%M МСК")
+        return dt_msk.strftime("%d.%m.%Y %H:%M")
     return str(dt)
 
 @app.post("/webhooks/telegram")
@@ -1423,7 +1456,7 @@ Username: {username_str}
                 
                 player_id = player_row[0]
                 
-                # Query future tournaments (starts_at >= now())
+                # Query future tournaments (starts_at > now(), strictly future)
                 query = """
                     SELECT 
                         e.id as entry_id,
@@ -1431,11 +1464,12 @@ Username: {username_str}
                         t.starts_at,
                         t.price_rub,
                         t.tournament_type,
+                        t.location,
                         e.payment_status
                     FROM entries e
                     JOIN tournaments t ON e.tournament_id = t.id
                     WHERE e.player_id = %s 
-                      AND t.starts_at >= NOW()
+                      AND t.starts_at > NOW()
                     ORDER BY t.starts_at ASC
                 """
                 
@@ -1448,15 +1482,15 @@ Username: {username_str}
                 if not rows:
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="У тебя нет предстоящих турниров."
+                        text="У тебя пока нет ближайших турниров."
                     )
                     return {"ok": True}
                 
                 # Send message for each entry
                 for row in rows:
-                    entry_id, title, starts_at, price_rub, tournament_type, payment_status = row
+                    entry_id, title, starts_at, price_rub, tournament_type, location, payment_status = row
                     
-                    # Format starts_at in MSK timezone
+                    # Format starts_at (without MSK suffix)
                     if starts_at:
                         # Convert to UTC if timezone-naive
                         if starts_at.tzinfo is None:
@@ -1466,7 +1500,7 @@ Username: {username_str}
                         
                         # Convert to MSK
                         starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
-                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M MSK")
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
                     else:
                         starts_at_str = "Не указано"
                     
@@ -1474,11 +1508,12 @@ Username: {username_str}
                     status_emoji = "✅" if payment_status == "paid" else "⏳"
                     status_text = "Оплачено" if payment_status == "paid" else "Не оплачено"
                     
-                    # Build message
+                    # Build message with location
+                    location_str = location or "Не указано"
                     message = f"""<b>{title}</b>
-
-📅 Дата/время: {starts_at_str}
-{status_emoji} Статус: {status_text}"""
+Место: {location_str}
+Время: {starts_at_str}
+{status_emoji} {status_text}"""
                     
                     # Create inline keyboard if not paid
                     keyboard = None
@@ -2015,7 +2050,7 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 chat_id = int(telegram_id)
                 print(f"ENTRY {entry_id}: action=send, telegram_id={telegram_id}")
 
-                # Format starts_at in MSK
+                # Format starts_at (without MSK suffix)
                 if starts_at:
                     if isinstance(starts_at, datetime):
                         if starts_at.tzinfo is None:
@@ -2023,11 +2058,14 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                         else:
                             starts_at_utc = starts_at.astimezone(timezone.utc)
                         starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
-                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M МСК")
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
                     else:
                         starts_at_str = str(starts_at)
                 else:
                     starts_at_str = "Не указано"
+                
+                # Get location
+                location_str = location or "Не указано"
                 
                 # Используем вечную ссылку
                 # Для team турниров по умолчанию 50%, для personal - 100%
@@ -2042,7 +2080,9 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                     msg = (
                         "🎾 Ты записан на турнир!\n\n"
                         f"🏷️ {title}\n"
+                        f"📍 {location_str}\n"
                         f"🕒 {starts_at_str}\n"
+                        f"💳 Цена: {price_rub} ₽ за пару\n"
                     )
                     
                     # Создаем inline keyboard с кнопкой "Оплатить" (callback для выбора 50%/100%)
@@ -2058,6 +2098,7 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                     msg = (
                         "🎾 Ты записан на турнир!\n\n"
                         f"🏷️ {title}\n"
+                        f"📍 {location_str}\n"
                         f"🕒 {starts_at_str}\n"
                         f"💳 {price_rub} ₽\n\n"
                     )

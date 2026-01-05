@@ -18,6 +18,8 @@ from datetime import datetime
 import psycopg2
 from psycopg2.extras import execute_values
 from pathlib import Path
+import requests
+import sys
 
 def get_db_conn():
     """Get database connection with SSL."""
@@ -382,7 +384,7 @@ def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, 
         return
     
     # Find tournaments from 'lunda' source that were not seen in this run
-    # Only process tournaments with source='lunda' (don't touch manual tournaments)
+    # Only process tournaments with source='lunda' AND active=true (don't touch manual tournaments or already archived)
     if processed_tournament_ids:
         # Use NOT IN for list of IDs
         placeholders = ','.join(['%s'] * len(processed_tournament_ids))
@@ -390,7 +392,8 @@ def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, 
             SELECT t.id, t.title, t.location, t.starts_at
             FROM tournaments t
             WHERE t.source = 'lunda'
-              AND t.last_seen_in_source < %s
+              AND t.active = true
+              AND (t.last_seen_in_source < %s OR t.last_seen_in_source IS NULL)
               AND t.id NOT IN ({placeholders})
         """
         params = [run_started_at] + list(processed_tournament_ids)
@@ -400,7 +403,8 @@ def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, 
             SELECT t.id, t.title, t.location, t.starts_at
             FROM tournaments t
             WHERE t.source = 'lunda'
-              AND t.last_seen_in_source < %s
+              AND t.active = true
+              AND (t.last_seen_in_source < %s OR t.last_seen_in_source IS NULL)
         """
         params = [run_started_at]
     
@@ -409,29 +413,32 @@ def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, 
     
     for tournament_id, title, location, starts_at in missing_tournaments:
         # Archive tournament (don't delete - preserve history)
+        # Only archive tournaments with source='lunda' that are currently active
         if has_active and has_archived_at:
             cur.execute("""
                 UPDATE tournaments
                 SET active = false, archived_at = NOW()
-                WHERE id = %s
+                WHERE id = %s AND source = 'lunda' AND active = true
             """, (tournament_id,))
         elif has_active:
             cur.execute("""
                 UPDATE tournaments
                 SET active = false
-                WHERE id = %s
+                WHERE id = %s AND source = 'lunda' AND active = true
             """, (tournament_id,))
         
-        # Also deactivate all entries for this tournament (both paid and pending)
-        if has_entry_active:
-            cur.execute("""
-                UPDATE entries
-                SET active = false
-                WHERE tournament_id = %s
-            """, (tournament_id,))
-        
-        stats['tournaments_archived'] += 1
-        print(f"ARCHIVED tournament: id={tournament_id}, title={title}, location={location}")
+        # Check if tournament was actually updated
+        if cur.rowcount > 0:
+            # Also deactivate all entries for this tournament (both paid and pending)
+            if has_entry_active:
+                cur.execute("""
+                    UPDATE entries
+                    SET active = false
+                    WHERE tournament_id = %s
+                """, (tournament_id,))
+            
+            stats['tournaments_archived'] += 1
+            print(f"ARCHIVED tournament: id={tournament_id}, title={title}, location={location}")
     
     conn.commit()
 
@@ -571,7 +578,36 @@ def main():
         print(f"ERROR: {error_occurred}")
     print("="*50)
     
-    return 1 if error_occurred else 0
+    # Auto-trigger Telegram notifications if import was successful
+    if not error_occurred:
+        print("\n" + "="*50)
+        print("AUTO-TRIGGERING TELEGRAM NOTIFICATIONS")
+        print("="*50)
+        try:
+            backend_base_url = os.getenv("BACKEND_BASE_URL", "https://padel-payments.onrender.com")
+            endpoint_url = f"{backend_base_url}/admin/process-new-entries?limit=500"
+            
+            print(f"POST {endpoint_url}")
+            response = requests.post(endpoint_url, timeout=30)
+            
+            print(f"Status: {response.status_code}")
+            if response.status_code == 200:
+                result = response.json()
+                print(f"Response: processed={result.get('processed', 0)}, notified={result.get('notified', 0)}")
+            else:
+                print(f"Error response: {response.text}")
+        except requests.exceptions.Timeout:
+            print("ERROR: Request timeout (30s)")
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR: Request failed: {e}")
+        except Exception as e:
+            print(f"ERROR: Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+        print("="*50)
+    
+    # Always return 0 (success) even if notification POST failed (for cron)
+    return 0
 
 if __name__ == "__main__":
     exit(main())

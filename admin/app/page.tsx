@@ -40,7 +40,7 @@ export default function AdminPage() {
       // Load tournaments - query tournaments table directly to get both active and archived
       const { data: tournamentsData, error: tournamentsError } = await supabase
         .from("tournaments")
-        .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, last_seen_in_source")
+        .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source")
         .order("starts_at", { ascending: true });
       
       if (tournamentsError) {
@@ -244,7 +244,7 @@ export default function AdminPage() {
 
       {openTournamentId === t.tournament_id && (
         <tr key={`details-${t.tournament_id}`}>
-          <td colSpan={7} className="border border-gray-500 px-2 py-3 bg-gray-800 text-white">
+          <td colSpan={8} className="border border-gray-500 px-2 py-3 bg-gray-800 text-white">
             <div className="font-semibold mb-2">Участники</div>
 
             <table className="w-full text-sm">
@@ -253,7 +253,8 @@ export default function AdminPage() {
                   <th className="border border-gray-500 py-1 px-2">Игрок</th>
                   <th className="border border-gray-500 py-1 px-2">Статус</th>
                   <th className="border border-gray-500 py-1 px-2">Уведомление</th>
-                  <th className="border border-gray-500 py-1 px-2">Обновлено</th>
+                  <th className="border border-gray-500 py-1 px-2">Добавлен</th>
+                  <th className="border border-gray-500 py-1 px-2">Обновлен</th>
                   <th className="border border-gray-500 py-1 px-2">Ссылка</th>
                 </tr>
               </thead>
@@ -281,8 +282,15 @@ export default function AdminPage() {
                       )}
                     </td>
                     <td className="py-1 px-2 border border-gray-500 text-xs">
-                      {e.source_last_updated ? (
-                        formatMSK(e.source_last_updated)
+                      {e.first_seen_in_source ? (
+                        formatMSK(e.first_seen_in_source)
+                      ) : (
+                        <span className="text-gray-400">—</span>
+                      )}
+                    </td>
+                    <td className="py-1 px-2 border border-gray-500 text-xs">
+                      {e.last_seen_in_source ? (
+                        formatMSK(e.last_seen_in_source)
                       ) : (
                         <span className="text-gray-400">—</span>
                       )}
