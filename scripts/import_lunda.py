@@ -17,6 +17,7 @@ import re
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import execute_values
+from pathlib import Path
 
 def get_db_conn():
     """Get database connection with SSL."""
@@ -113,7 +114,7 @@ def upsert_entry(conn, tournament_id, player_id):
     existing = cur.fetchone()
     
     if existing:
-        # Entry exists - update active and last_seen_in_source
+        # Entry exists - update active and last_seen_in_source (don't touch first_seen_in_source)
         entry_id = existing[0]
         cur.execute("""
             UPDATE entries
@@ -123,10 +124,10 @@ def upsert_entry(conn, tournament_id, player_id):
         conn.commit()
         return (entry_id, False)
     else:
-        # New entry - create with payment_status='pending', active=true
+        # New entry - create with payment_status='pending', active=true, both timestamps = now()
         cur.execute("""
-            INSERT INTO entries (tournament_id, player_id, payment_status, active, last_seen_in_source)
-            VALUES (%s, %s, 'pending', true, NOW())
+            INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+            VALUES (%s, %s, 'pending', true, NOW(), NOW())
             RETURNING id
         """, (tournament_id, player_id))
         entry_id = cur.fetchone()[0]
@@ -166,9 +167,9 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None):
         # UPSERT entry
         entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
         if was_new:
-            stats['entries_upsert_new'] += 1
+            stats['entries_new'] += 1
         else:
-            stats['entries_upsert_existing'] += 1
+            stats['entries_existing'] += 1
     
     # 5. Handle entries that are no longer in participants
     # Get player_ids for new participants
@@ -191,11 +192,58 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None):
                     SET active = false
                     WHERE id = %s
                 """, (entry_id,))
-                stats['entries_marked_inactive'] += 1
+                stats['entries_inactivated'] += 1
             else:
                 # Delete entry (not paid, safe to delete)
                 cur.execute("DELETE FROM entries WHERE id = %s", (entry_id,))
                 stats['entries_deleted'] += 1
+    
+    conn.commit()
+
+def create_sync_run(conn, json_path):
+    """Create sync_runs record and return sync_run_id."""
+    cur = conn.cursor()
+    
+    # Get JSON file mtime
+    json_mtime = None
+    if json_path and os.path.exists(json_path):
+        json_mtime = datetime.fromtimestamp(os.path.getmtime(json_path))
+    
+    cur.execute("""
+        INSERT INTO sync_runs (source, started_at, json_path, json_mtime)
+        VALUES ('lunda', NOW(), %s, %s)
+        RETURNING id
+    """, (json_path, json_mtime))
+    
+    sync_run_id = cur.fetchone()[0]
+    conn.commit()
+    return sync_run_id
+
+def update_sync_run(conn, sync_run_id, stats, error=None):
+    """Update sync_runs record with statistics."""
+    cur = conn.cursor()
+    
+    cur.execute("""
+        UPDATE sync_runs
+        SET finished_at = NOW(),
+            tournaments_upsert = %s,
+            players_upsert = %s,
+            entries_new = %s,
+            entries_existing = %s,
+            entries_deleted = %s,
+            entries_inactivated = %s,
+            error = %s
+        WHERE id = %s
+    """, (
+        stats.get('tournaments_upsert', 0),
+        stats.get('players_upsert', 0),
+        stats.get('entries_new', 0),
+        stats.get('entries_existing', 0),
+        stats.get('entries_deleted', 0),
+        stats.get('entries_inactivated', 0),
+        error,
+        sync_run_id
+    ))
     
     conn.commit()
 
@@ -255,17 +303,27 @@ def main():
         print(f"ERROR: Failed to connect to database: {e}")
         return 1
     
+    # Create sync run record
+    sync_run_id = None
+    try:
+        sync_run_id = create_sync_run(conn, json_path)
+        print(f"Created sync run: id={sync_run_id}")
+    except Exception as e:
+        print(f"WARNING: Failed to create sync run: {e}")
+        # Continue anyway
+    
     # Statistics
     stats = {
         'tournaments_upsert': 0,
         'players_upsert': 0,
-        'entries_upsert_new': 0,
-        'entries_upsert_existing': 0,
-        'entries_marked_inactive': 0,
-        'entries_deleted': 0
+        'entries_new': 0,
+        'entries_existing': 0,
+        'entries_deleted': 0,
+        'entries_inactivated': 0
     }
     
     # Process each tournament
+    error_occurred = None
     try:
         for tournament_data in tournaments_list:
             tournament_info = tournament_data.get('tournament', {})
@@ -274,12 +332,20 @@ def main():
             print(f"Processing tournament: {title} at {location}")
             process_tournament(conn, tournament_data, stats, global_last_updated)
     except Exception as e:
-        print(f"ERROR during processing: {e}")
+        error_occurred = str(e)
+        print(f"ERROR during processing: {error_occurred}")
         import traceback
         traceback.print_exc()
         conn.rollback()
-        return 1
     finally:
+        # Update sync run with statistics
+        if sync_run_id:
+            try:
+                update_sync_run(conn, sync_run_id, stats, error_occurred)
+                print(f"Updated sync run: id={sync_run_id}")
+            except Exception as e:
+                print(f"WARNING: Failed to update sync run: {e}")
+        
         conn.close()
     
     # Print statistics
@@ -288,13 +354,15 @@ def main():
     print("="*50)
     print(f"Tournaments UPSERT: {stats['tournaments_upsert']}")
     print(f"Players UPSERT: {stats['players_upsert']}")
-    print(f"Entries UPSERT (new): {stats['entries_upsert_new']}")
-    print(f"Entries UPSERT (existing): {stats['entries_upsert_existing']}")
-    print(f"Entries marked inactive: {stats['entries_marked_inactive']}")
-    print(f"Entries deleted: {stats['entries_deleted']}")
+    print(f"Entries NEW: {stats['entries_new']}")
+    print(f"Entries EXISTING (confirmed): {stats['entries_existing']}")
+    print(f"Entries INACTIVATED: {stats['entries_inactivated']}")
+    print(f"Entries DELETED: {stats['entries_deleted']}")
+    if error_occurred:
+        print(f"ERROR: {error_occurred}")
     print("="*50)
     
-    return 0
+    return 1 if error_occurred else 0
 
 if __name__ == "__main__":
     exit(main())

@@ -1845,6 +1845,63 @@ Username: {username_str}
     from fastapi import Query
 from datetime import datetime
 
+@app.get("/admin/last-sync")
+def get_last_sync():
+    """Get last sync run information from sync_runs table."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return {"ok": False, "error": "DATABASE_URL not set"}
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT 
+                id,
+                source,
+                started_at,
+                finished_at,
+                tournaments_upsert,
+                players_upsert,
+                entries_new,
+                entries_existing,
+                entries_deleted,
+                entries_inactivated,
+                error,
+                json_path,
+                json_mtime
+            FROM sync_runs
+            ORDER BY started_at DESC
+            LIMIT 1
+        """)
+        
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not row:
+            return {"ok": True, "message": "No sync runs found"}
+        
+        return {
+            "ok": True,
+            "id": row[0],
+            "source": row[1],
+            "started_at": row[2].isoformat() if row[2] else None,
+            "finished_at": row[3].isoformat() if row[3] else None,
+            "tournaments_upsert": row[4],
+            "players_upsert": row[5],
+            "entries_new": row[6],
+            "entries_existing": row[7],
+            "entries_deleted": row[8],
+            "entries_inactivated": row[9],
+            "error": row[10],
+            "json_path": row[11],
+            "json_mtime": row[12].isoformat() if row[12] else None
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.post("/admin/process-new-entries")
 async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
     """
