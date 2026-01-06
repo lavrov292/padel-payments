@@ -136,13 +136,18 @@ def db_check():
 def payment_entry_link(
     entry_id: int, 
     pay: str = Query("default", description="Payment mode: 'half' for 50%, 'full' for 100%, 'default' for auto"),
-    partner_entry_id: int = Query(None, description="Partner entry ID for pair payment (when pay=full)")
+    request: Request = None
 ):
     """
     Вечная ссылка на оплату entry. Проверяет статус платежа и создает новый при необходимости.
     Query param 'pay': 'half' (50%), 'full' (100%), 'default' (auto based on tournament_type)
     Query param 'partner_entry_id': ID партнёра для оплаты за пару (только при pay=full)
     """
+    # Читаем partner_entry_id из query параметров
+    partner_entry_id = None
+    if request:
+        partner_entry_id = request.query_params.get("partner_entry_id")
+    
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         return HTMLResponse(content="<html><body>Ошибка: база данных не настроена</body></html>", status_code=500)
@@ -210,18 +215,70 @@ def payment_entry_link(
                 print(f"PAYMENT ERROR: {str(e)}, creating new")
                 payment_id = None
         
+        # Валидация partner_entry_id из query параметров
+        partner_entry_id_int = None
+        partner_entry = None
+        
+        if partner_entry_id is not None:
+            try:
+                partner_entry_id_int = int(partner_entry_id)
+            except (ValueError, TypeError):
+                cur.close()
+                conn.close()
+                return HTMLResponse(content="<html><body>Ошибка: Некорректный partner_entry_id</body></html>", status_code=400)
+            
+            # Проверка, что partner_entry_id != entry_id
+            if partner_entry_id_int == entry_id:
+                cur.close()
+                conn.close()
+                return HTMLResponse(content="<html><body>Ошибка: нельзя оплатить за самого себя</body></html>", status_code=400)
+            
+            # Получаем entry партнёра из БД
+            cur.execute("""
+                SELECT id, payment_status, tournament_id
+                FROM entries
+                WHERE id = %s
+            """, (partner_entry_id_int,))
+            partner_row = cur.fetchone()
+            
+            if not partner_row:
+                cur.close()
+                conn.close()
+                return HTMLResponse(content="<html><body>Ошибка: запись партнёра не найдена</body></html>", status_code=404)
+            
+            partner_id, partner_status, partner_tournament_id = partner_row
+            
+            # Проверка, что оба entry относятся к одному турниру
+            if partner_tournament_id != tournament_id:
+                cur.close()
+                conn.close()
+                return HTMLResponse(content="<html><body>Ошибка: записи относятся к разным турнирам</body></html>", status_code=400)
+            
+            # Проверка, что партнёр ещё не оплатил
+            if partner_status == 'paid':
+                cur.close()
+                conn.close()
+                return HTMLResponse(content="<html><body>Ошибка: партнёр уже оплатил</body></html>", status_code=400)
+            
+            # Всё ок - сохраняем информацию о партнёре
+            partner_entry = {
+                "id": partner_id,
+                "payment_status": partner_status,
+                "tournament_id": partner_tournament_id
+            }
+        
         # Если платеж невалиден или payment_id пустой - создаем новый
-        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}, partner_entry_id={partner_entry_id}, partner_entry_id_valid={partner_entry_id_valid}")
+        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}, partner_entry_id={partner_entry_id_int}")
         
         # Determine payment scope and amount
         payment_scope = 'self'
         paid_for_entry_id_to_save = None
         
-        if tournament_type == 'team' and pay == 'full' and partner_entry_id_valid is not None:
-            # Team tournament: 100% (full pair payment)
+        if pay == 'full' and partner_entry_id_int is not None and partner_entry is not None:
+            # Pair payment: 100% (full pair payment)
             payment_amount = float(price_rub)
             payment_scope = 'pair'
-            paid_for_entry_id_to_save = partner_entry_id_valid
+            paid_for_entry_id_to_save = partner_entry_id_int
         elif tournament_type == 'team':
             if pay == 'full':
                 # Team tournament: 100% (full pair payment without partner specified - legacy)
@@ -285,21 +342,20 @@ def payment_entry_link(
             "expires_at": expires_at_str
         }
         
-        print(f"BEFORE Payment.create:")
-        print(f"  entry_id={entry_id}")
-        print(f"  pay={pay}")
-        print(f"  partner_entry_id={partner_entry_id}")
-        print(f"  partner_entry_id_valid={partner_entry_id_valid}")
-        print(f"  computed payment_scope={payment_scope}")
-        print(f"  paid_for_entry_id={paid_for_entry_id_to_save}")
-        print(f"  payment_amount={payment_amount:.2f}")
+        print("PAY CREATE:", {
+            "entry_id": entry_id,
+            "pay": pay,
+            "partner_entry_id": partner_entry_id_int,
+            "scope": payment_scope,
+            "paid_for": paid_for_entry_id_to_save
+        })
         print(f"PAYMENT CREATE PAYLOAD: entry_id={entry_id}, tournament_type={tournament_type}, amount={payment_amount:.2f}, payload={payment_data}")
         payment = Payment.create(payment_data, idempotence_key)
         
         new_payment_id = payment.id
         new_confirmation_url = payment.confirmation.confirmation_url
         
-        print(f"PAYMENT CREATED: payment_id={new_payment_id}, confirmation_url={new_confirmation_url}, payment_scope={payment_scope}, partner_entry_id={partner_entry_id_valid}")
+        print(f"PAYMENT CREATED: payment_id={new_payment_id}, confirmation_url={new_confirmation_url}, payment_scope={payment_scope}, paid_for_entry_id={paid_for_entry_id_to_save}")
         
         # Сохраняем payment_id, payment_url, payment_scope и paid_for_entry_id в entries
         update_query = """
