@@ -1,0 +1,15 @@
+.venv
+node_modules
+admin/node_modules
+admin/.next
+**/*.dylib
+**/*.so
+**/*.node
+**/*.zip
+**/*.png
+**/*.jpg
+**/*.mp4
+**/*.sqlite
+**/*.db
+.cursor
+.git

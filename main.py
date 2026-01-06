@@ -5,7 +5,8 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 import os
 import uuid
 import traceback
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import datetime, timedelta, timezone, date
 import pytz
 from fastapi import FastAPI, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,7 +58,7 @@ def set_support_mode(telegram_id, enabled):
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO telegram_sessions (telegram_id, support_mode, updated_at)
-            VALUES (%s::text, %s, NOW())
+            VALUES (%s, %s, NOW())
             ON CONFLICT (telegram_id)
             DO UPDATE SET support_mode = %s, updated_at = NOW()
         """, (telegram_id, enabled, enabled))
@@ -72,7 +73,7 @@ def get_support_mode(telegram_id):
         cur = conn.cursor()
         cur.execute("""
             SELECT support_mode FROM telegram_sessions
-            WHERE telegram_id = %s::text
+            WHERE telegram_id = %s
         """, (telegram_id,))
         row = cur.fetchone()
         return row[0] if row else False
@@ -86,7 +87,7 @@ def get_player_by_tg(telegram_id):
         cur = conn.cursor()
         cur.execute("""
             SELECT id, full_name FROM players
-            WHERE telegram_id = %s::text
+            WHERE telegram_id = %s
         """, (telegram_id,))
         row = cur.fetchone()
         return row if row else None
@@ -1400,17 +1401,9 @@ async def telegram_webhook(request: Request):
                 await bot.send_message(chat_id=chat_id, text="Ошибка: не удалось определить ваш Telegram ID.")
                 return {"ok": True}
             
-            # Create reply keyboard (always show)
-            keyboard = ReplyKeyboardMarkup(
-                [
-                    [KeyboardButton("Мои турниры"), KeyboardButton("Помощь")]
-                ],
-                resize_keyboard=True
-            )
-            
             database_url = os.getenv("DATABASE_URL")
             if not database_url:
-                await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.", reply_markup=keyboard)
+                await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
                 return {"ok": True}
             
             try:
@@ -1418,39 +1411,42 @@ async def telegram_webhook(request: Request):
                 cur = conn.cursor()
                 
                 # Check if player exists with this telegram_id
-                print("TG DEBUG /start telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
-                cur.execute("SELECT full_name FROM players WHERE telegram_id = %s::text", (telegram_user_id,))
+                cur.execute("SELECT full_name FROM players WHERE telegram_id = %s", (telegram_user_id,))
                 row = cur.fetchone()
                 
                 if row:
-                    # Player exists, greet them
+                    # Player exists, show menu with "Мои турниры" and "Помощь"
                     player_name = row[0]
                     welcome_text = f"Привет, {player_name}!"
+                    keyboard = ReplyKeyboardMarkup(
+                        [
+                            [KeyboardButton("Мои турниры"), KeyboardButton("Помощь")]
+                        ],
+                        resize_keyboard=True
+                    )
                     await bot.send_message(
                         chat_id=chat_id,
                         text=welcome_text,
                         reply_markup=keyboard
                     )
                 else:
-                    # Player not found, create session and ask for Lunda name
-                    cur.execute("""
-                        INSERT INTO telegram_sessions (telegram_id, state, temp_name)
-                        VALUES (%s, 'awaiting_lunda_name', NULL)
-                        ON CONFLICT (telegram_id) 
-                        DO UPDATE SET state = 'awaiting_lunda_name', temp_name = NULL
-                    """, (telegram_user_id,))
-                    conn.commit()
-                    
+                    # Player not found, show menu with "Привязать аккаунт" and "Помощь"
+                    keyboard = ReplyKeyboardMarkup(
+                        [
+                            [KeyboardButton("Привязать аккаунт"), KeyboardButton("Помощь")]
+                        ],
+                        resize_keyboard=True
+                    )
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="Напиши, как ты называешься в Lunda (слово в слово). Например: Иван Иванов",
+                        text="Привет! Чтобы начать, нужно привязать аккаунт.",
                         reply_markup=keyboard
                     )
                 
                 cur.close()
                 conn.close()
             except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"Ошибка: {str(e)}", reply_markup=keyboard)
+                await bot.send_message(chat_id=chat_id, text=f"Ошибка: {str(e)}")
             
             return {"ok": True}
         
@@ -1545,7 +1541,7 @@ Text: {text}"""
                         cur.execute("""
                             SELECT state, temp_name 
                             FROM telegram_sessions 
-                            WHERE telegram_id = %s::text AND state = 'awaiting_lunda_name'
+                            WHERE telegram_id = %s AND state = 'awaiting_lunda_name'
                         """, (telegram_user_id,))
                         session_row = cur.fetchone()
                         
@@ -1558,7 +1554,7 @@ Text: {text}"""
                             cur.execute("""
                                 UPDATE telegram_sessions 
                                 SET temp_name = %s 
-                                WHERE telegram_id = %s::text
+                                WHERE telegram_id = %s
                             """, (provided_name, telegram_user_id))
                             conn.commit()
                             
@@ -1583,7 +1579,7 @@ Text: {text}"""
                                 
                                 # Delete session
                                 print("TG DEBUG delete session telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
-                                cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s::text", (telegram_user_id,))
+                                cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
                                 conn.commit()
                                 
                                 cur.close()
@@ -1600,7 +1596,7 @@ Text: {text}"""
                                 cur.execute("""
                                     UPDATE telegram_sessions 
                                     SET state = 'needs_manual_link' 
-                                    WHERE telegram_id = %s::text
+                                    WHERE telegram_id = %s
                                 """, (telegram_user_id,))
                                 conn.commit()
                                 
@@ -1671,15 +1667,23 @@ Username: {username_str}
                 # Гарантированно приводим к строке перед запросом
                 telegram_user_id = str(telegram_user_id)
                 print("DEBUG my_tournaments telegram_user_id=", telegram_user_id, "type=", type(telegram_user_id))
-                cur.execute("SELECT id FROM players WHERE telegram_id = %s::text", (telegram_user_id,))
+                cur.execute("SELECT id FROM players WHERE telegram_id = %s", (telegram_user_id,))
                 player_row = cur.fetchone()
                 
                 if not player_row:
                     cur.close()
                     conn.close()
+                    # Show menu with "Привязать аккаунт"
+                    keyboard = ReplyKeyboardMarkup(
+                        [
+                            [KeyboardButton("Привязать аккаунт"), KeyboardButton("Помощь")]
+                        ],
+                        resize_keyboard=True
+                    )
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="Я тебя не нашёл в базе. Напиши как ты называешься в Lunda (Фамилия Имя)."
+                        text="Я тебя не нашёл в базе. Нажми «Привязать аккаунт», чтобы привязаться через выбор турнира.",
+                        reply_markup=keyboard
                     )
                     return {"ok": True}
                 
@@ -1794,6 +1798,90 @@ Username: {username_str}
                     chat_id=chat_id,
                     text="Опиши проблему одним сообщением. Я отправлю её администратору."
                 )
+                return {"ok": True}
+            except Exception as e:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ошибка: {str(e)}"
+                )
+                return {"ok": True}
+
+        # "Привязать аккаунт" button
+        if text == "Привязать аккаунт":
+            telegram_user_id = tg_id_str(from_user)
+            if not telegram_user_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка: не удалось определить ваш Telegram ID."
+                )
+                return {"ok": True}
+            
+            database_url = os.getenv("DATABASE_URL")
+            if not database_url:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Ошибка: база данных не настроена."
+                )
+                return {"ok": True}
+            
+            try:
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get distinct dates of future tournaments
+                cur.execute("""
+                    SELECT DISTINCT DATE(starts_at AT TIME ZONE 'Europe/Moscow') AS tournament_date
+                    FROM tournaments
+                    WHERE archived_at IS NULL
+                      AND starts_at >= NOW()
+                    ORDER BY tournament_date ASC
+                    LIMIT 10
+                """)
+                date_rows = cur.fetchall()
+                
+                if not date_rows:
+                    cur.close()
+                    conn.close()
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Пока не вижу ближайших турниров в базе. Запишись на турнир в Lunda и попробуй снова 🙂"
+                    )
+                    return {"ok": True}
+                
+                # Create buttons for dates
+                buttons = []
+                for (date_obj,) in date_rows:
+                    # Format date for display: DD.MM.YYYY
+                    # date_obj from PostgreSQL DATE() is a date or datetime object
+                    if isinstance(date_obj, (datetime, date)):
+                        date_display = date_obj.strftime("%d.%m.%Y")
+                        date_callback = date_obj.strftime("%Y-%m-%d")
+                    else:
+                        # If it's a string or other type, try to parse it
+                        try:
+                            from dateutil import parser
+                            date_parsed = parser.parse(str(date_obj))
+                            date_display = date_parsed.strftime("%d.%m.%Y")
+                            date_callback = date_parsed.strftime("%Y-%m-%d")
+                        except:
+                            date_display = str(date_obj)
+                            date_callback = str(date_obj)
+                    
+                    buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_callback}")])
+                
+                # Add Cancel button
+                buttons.append([InlineKeyboardButton("Отмена", callback_data="bind_back:menu")])
+                
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Выбери дату турнира:",
+                    reply_markup=keyboard
+                )
+                
+                cur.close()
+                conn.close()
                 return {"ok": True}
             except Exception as e:
                 await bot.send_message(
@@ -2103,6 +2191,649 @@ Username: {username_str}
             except Exception as e:
                 await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
                 return {"ok": True}
+        
+        # Bind account flow callbacks
+        from_user = callback_query.get("from", {})
+        telegram_user_id = str(from_user.get("id", "")) if from_user.get("id") else None
+        
+        # bind_date:<date> - выбор даты
+        if data.startswith("bind_date:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                date_str = data.split(":", 1)[1]
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Parse date_str - может быть в формате YYYY-MM-DD или datetime object
+                try:
+                    # Попробуем распарсить как дату
+                    if isinstance(date_str, str):
+                        # Если это строка вида "2026-01-10", используем как есть
+                        # Если это datetime object string, парсим
+                        from dateutil import parser
+                        date_parsed = parser.parse(date_str)
+                        date_str = date_parsed.strftime("%Y-%m-%d")
+                except:
+                    # Если не парсится, используем как есть (уже в формате YYYY-MM-DD)
+                    pass
+                
+                # Get tournaments for this date
+                cur.execute("""
+                    SELECT id, title, starts_at, location
+                    FROM tournaments
+                    WHERE DATE(starts_at) = %s::date
+                      AND starts_at > NOW()
+                      AND archived_at IS NULL
+                    ORDER BY starts_at ASC
+                """, (date_str,))
+                tournaments = cur.fetchall()
+                
+                if not tournaments:
+                    await bot.send_message(chat_id=chat_id, text="На эту дату нет доступных турниров.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Update session
+                session_data = json.dumps({"selected_date": date_str})
+                cur.execute("""
+                    UPDATE telegram_sessions
+                    SET state = 'bind_pick_tournament', data = %s
+                    WHERE telegram_id = %s
+                """, (session_data, telegram_user_id))
+                conn.commit()
+                
+                # Create buttons for tournaments
+                buttons = []
+                for tournament_id, title, starts_at, location in tournaments:
+                    # Format time
+                    if starts_at:
+                        if isinstance(starts_at, datetime):
+                            if starts_at.tzinfo is None:
+                                starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                            else:
+                                starts_at_utc = starts_at.astimezone(timezone.utc)
+                            starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                            time_str = starts_at_msk.strftime("%H:%M")
+                        else:
+                            time_str = str(starts_at)
+                    else:
+                        time_str = "??:??"
+                    
+                    location_str = location or ""
+                    button_text = f"{title[:30]} — {time_str}" if len(title) <= 30 else f"{title[:27]}... — {time_str}"
+                    buttons.append([InlineKeyboardButton(button_text, callback_data=f"bind_pick_tournament:{tournament_id}")])
+                
+                buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:date")])
+                
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Выбери турнир:",
+                    reply_markup=keyboard
+                )
+                
+                print(f"BIND: выбранная дата={date_str}")
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"BIND DATE ERROR: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+            return {"ok": True}
+        
+        # bind_pick_tournament:<tournament_id> - выбор турнира
+        if data.startswith("bind_pick_tournament:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                tournament_id = int(data.split(":")[1])
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get tournament info
+                cur.execute("""
+                    SELECT title, location, starts_at
+                    FROM tournaments
+                    WHERE id = %s
+                """, (tournament_id,))
+                tournament_row = cur.fetchone()
+                
+                if not tournament_row:
+                    await bot.send_message(chat_id=chat_id, text="Турнир не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                tournament_title, location, starts_at = tournament_row
+                
+                # Get players for this tournament (paginated)
+                cur.execute("""
+                    SELECT p.id, p.full_name
+                    FROM entries e
+                    JOIN players p ON e.player_id = p.id
+                    WHERE e.tournament_id = %s
+                      AND e.active = true
+                    ORDER BY p.full_name ASC
+                """, (tournament_id,))
+                players = cur.fetchall()
+                
+                if not players:
+                    await bot.send_message(chat_id=chat_id, text="В этом турнире нет участников.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Update session
+                session_data = json.dumps({"selected_tournament_id": tournament_id, "page": 0})
+                cur.execute("""
+                    UPDATE telegram_sessions
+                    SET state = 'bind_pick_player', data = %s
+                    WHERE telegram_id = %s
+                """, (session_data, telegram_user_id))
+                conn.commit()
+                
+                # Show first page of players
+                page = 0
+                players_per_page = 10
+                start_idx = page * players_per_page
+                end_idx = start_idx + players_per_page
+                page_players = players[start_idx:end_idx]
+                
+                buttons = []
+                for player_id, full_name in page_players:
+                    buttons.append([InlineKeyboardButton(full_name, callback_data=f"bind_pick_player:{tournament_id}:{player_id}:{page}")])
+                
+                # Navigation buttons
+                nav_buttons = []
+                if page > 0:
+                    nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"bind_player_page:{tournament_id}:{page-1}"))
+                if end_idx < len(players):
+                    nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"bind_player_page:{tournament_id}:{page+1}"))
+                if nav_buttons:
+                    buttons.append(nav_buttons)
+                
+                buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:tournament")])
+                buttons.append([InlineKeyboardButton("Отмена", callback_data="bind_back:menu")])
+                
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Выбери себя из списка участников:",
+                    reply_markup=keyboard
+                )
+                
+                print(f"BIND: выбранный турнир={tournament_id}, title={tournament_title}")
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"BIND TOURNAMENT ERROR: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+            return {"ok": True}
+        
+        # bind_player_page:<tournament_id>:<page> - пагинация участников
+        if data.startswith("bind_player_page:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                parts = data.split(":")
+                tournament_id = int(parts[1])
+                page = int(parts[2])
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get players
+                cur.execute("""
+                    SELECT p.id, p.full_name
+                    FROM entries e
+                    JOIN players p ON e.player_id = p.id
+                    WHERE e.tournament_id = %s
+                      AND e.active = true
+                    ORDER BY p.full_name ASC
+                """, (tournament_id,))
+                players = cur.fetchall()
+                
+                players_per_page = 10
+                start_idx = page * players_per_page
+                end_idx = start_idx + players_per_page
+                page_players = players[start_idx:end_idx]
+                
+                buttons = []
+                for player_id, full_name in page_players:
+                    buttons.append([InlineKeyboardButton(full_name, callback_data=f"bind_pick_player:{tournament_id}:{player_id}:{page}")])
+                
+                # Navigation buttons
+                nav_buttons = []
+                if page > 0:
+                    nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"bind_player_page:{tournament_id}:{page-1}"))
+                if end_idx < len(players):
+                    nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"bind_player_page:{tournament_id}:{page+1}"))
+                if nav_buttons:
+                    buttons.append(nav_buttons)
+                
+                buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:tournament")])
+                buttons.append([InlineKeyboardButton("Отмена", callback_data="bind_back:menu")])
+                
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                # Edit message
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard
+                )
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"BIND PAGE ERROR: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+            return {"ok": True}
+        
+        # bind_pick_player:<tournament_id>:<player_id>:<page> - выбор участника
+        if data.startswith("bind_pick_player:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                parts = data.split(":")
+                tournament_id = int(parts[1])
+                player_id = int(parts[2])
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get player and tournament info
+                cur.execute("""
+                    SELECT p.full_name, t.title, t.location, t.starts_at
+                    FROM players p, tournaments t
+                    WHERE p.id = %s AND t.id = %s
+                """, (player_id, tournament_id))
+                row = cur.fetchone()
+                
+                if not row:
+                    await bot.send_message(chat_id=chat_id, text="Данные не найдены.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                player_name, tournament_title, location, starts_at = row
+                
+                # Format starts_at
+                if starts_at:
+                    if isinstance(starts_at, datetime):
+                        if starts_at.tzinfo is None:
+                            starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                        else:
+                            starts_at_utc = starts_at.astimezone(timezone.utc)
+                        starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
+                    else:
+                        starts_at_str = str(starts_at)
+                else:
+                    starts_at_str = "Не указано"
+                
+                # Update session
+                session_data = json.dumps({"selected_tournament_id": tournament_id, "selected_player_id": player_id})
+                cur.execute("""
+                    UPDATE telegram_sessions
+                    SET state = 'bind_confirm', data = %s
+                    WHERE telegram_id = %s
+                """, (session_data, telegram_user_id))
+                conn.commit()
+                
+                location_str = location or "Не указано"
+                
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Да, это я", callback_data=f"bind_confirm:{player_id}")],
+                    [InlineKeyboardButton("↩️ Назад", callback_data=f"bind_back:player:{tournament_id}")]
+                ])
+                
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Ты — {player_name}?\n\nТурнир: {tournament_title}\nМесто: {location_str}\nВремя: {starts_at_str}",
+                    reply_markup=keyboard
+                )
+                
+                print(f"BIND: выбранный player={player_id}, name={player_name}")
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"BIND PLAYER ERROR: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+            return {"ok": True}
+        
+        # bind_confirm:<player_id> - подтверждение привязки
+        if data.startswith("bind_confirm:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                player_id = int(data.split(":")[1])
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Check if this telegram_id is already bound to another player
+                cur.execute("""
+                    SELECT id, full_name FROM players WHERE telegram_id = %s AND id != %s
+                """, (telegram_user_id, player_id))
+                other_player = cur.fetchone()
+                
+                if other_player:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Этот Telegram уже привязан, напишите админу."
+                    )
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Check if selected player already has telegram_id
+                cur.execute("SELECT telegram_id FROM players WHERE id = %s", (player_id,))
+                player_row = cur.fetchone()
+                
+                if player_row and player_row[0] and player_row[0] != telegram_user_id:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Этот игрок уже привязан к другому Telegram."
+                    )
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Bind player
+                cur.execute("""
+                    UPDATE players
+                    SET telegram_id = %s
+                    WHERE id = %s
+                """, (telegram_user_id, player_id))
+                conn.commit()
+                
+                print(f"BIND CONFIRM: player_id={player_id}, telegram_id={telegram_user_id}, result=success")
+                
+                # Clear session
+                cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
+                conn.commit()
+                
+                # Send confirmation
+                await bot.send_message(chat_id=chat_id, text="Готово! Аккаунт привязан.")
+                
+                # Show new menu
+                keyboard = ReplyKeyboardMarkup(
+                    [
+                        [KeyboardButton("Мои турниры"), KeyboardButton("Помощь")]
+                    ],
+                    resize_keyboard=True
+                )
+                await bot.send_message(chat_id=chat_id, text="Теперь ты можешь использовать все функции бота.", reply_markup=keyboard)
+                
+                # Send notifications for future entries
+                cur.execute("""
+                    SELECT 
+                        e.id,
+                        t.title,
+                        t.starts_at,
+                        t.price_rub,
+                        t.tournament_type,
+                        t.location,
+                        p.full_name
+                    FROM entries e
+                    JOIN tournaments t ON e.tournament_id = t.id
+                    JOIN players p ON e.player_id = p.id
+                    WHERE e.player_id = %s
+                      AND e.telegram_notified = false
+                      AND t.starts_at > NOW()
+                      AND t.archived_at IS NULL
+                    ORDER BY t.starts_at ASC
+                """, (player_id,))
+                future_entries = cur.fetchall()
+                
+                public_base_url = os.getenv("PUBLIC_BASE_URL")
+                
+                for entry_id, title, starts_at, price_rub, tournament_type, location, full_name in future_entries:
+                    try:
+                        # Format starts_at
+                        if starts_at:
+                            if isinstance(starts_at, datetime):
+                                if starts_at.tzinfo is None:
+                                    starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                                else:
+                                    starts_at_utc = starts_at.astimezone(timezone.utc)
+                                starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                                starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
+                            else:
+                                starts_at_str = str(starts_at)
+                        else:
+                            starts_at_str = "Не указано"
+                        
+                        location_str = location or "Не указано"
+                        
+                        if tournament_type == 'team':
+                            msg = (
+                                "🎾 Ты записан на турнир!\n\n"
+                                f"🏷️ {title}\n"
+                                f"📍 {location_str}\n"
+                                f"🕒 {starts_at_str}\n"
+                                f"💳 Цена: {price_rub} ₽ за пару\n"
+                            )
+                            keyboard_entry = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("Оплатить", callback_data=f"pay:{entry_id}")]
+                            ])
+                        else:
+                            msg = (
+                                "🎾 Ты записан на турнир!\n\n"
+                                f"🏷️ {title}\n"
+                                f"📍 {location_str}\n"
+                                f"🕒 {starts_at_str}\n"
+                                f"💳 {price_rub} ₽\n\n"
+                            )
+                            keyboard_entry = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("Оплатить", callback_data=f"pay:{entry_id}")]
+                            ])
+                        
+                        await bot.send_message(chat_id=chat_id, text=msg, reply_markup=keyboard_entry)
+                        
+                        # Mark as notified
+                        cur.execute("""
+                            UPDATE entries
+                            SET telegram_notified = true, telegram_notified_at = NOW()
+                            WHERE id = %s
+                        """, (entry_id,))
+                        conn.commit()
+                    except Exception as e:
+                        print(f"BIND NOTIFICATION ERROR for entry {entry_id}: {str(e)}")
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"BIND CONFIRM ERROR: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+            return {"ok": True}
+        
+        # bind_back:* - навигация назад
+        if data.startswith("bind_back:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                back_type = data.split(":", 1)[1]
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                if back_type == "menu":
+                    # Back to menu - clear session
+                    cur.execute("DELETE FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
+                    conn.commit()
+                    
+                    keyboard = ReplyKeyboardMarkup(
+                        [
+                            [KeyboardButton("Привязать аккаунт"), KeyboardButton("Помощь")]
+                        ],
+                        resize_keyboard=True
+                    )
+                    await bot.send_message(chat_id=chat_id, text="Привязка отменена.", reply_markup=keyboard)
+                elif back_type == "date":
+                    # Back to date selection
+                    cur.execute("""
+                        UPDATE telegram_sessions
+                        SET state = 'bind_pick_date', data = '{}'
+                        WHERE telegram_id = %s
+                    """, (telegram_user_id,))
+                    conn.commit()
+                    
+                    # Get dates again
+                    cur.execute("""
+                        SELECT DISTINCT DATE(starts_at) as tournament_date
+                        FROM tournaments
+                        WHERE starts_at > NOW()
+                          AND archived_at IS NULL
+                        ORDER BY tournament_date ASC
+                        LIMIT 10
+                    """)
+                    date_rows = cur.fetchall()
+                    
+                    buttons = []
+                    for (date_obj,) in date_rows:
+                        if isinstance(date_obj, datetime):
+                            date_str = date_obj.strftime("%d.%m.%Y")
+                        else:
+                            date_str = str(date_obj)
+                        buttons.append([InlineKeyboardButton(date_str, callback_data=f"bind_date:{date_obj}")])
+                    
+                    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:menu")])
+                    
+                    keyboard = InlineKeyboardMarkup(buttons)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Выбери дату турнира:",
+                        reply_markup=keyboard
+                    )
+                elif back_type == "tournament":
+                    # Back to tournament selection - need to get date from session
+                    cur.execute("SELECT data FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
+                    session_row = cur.fetchone()
+                    
+                    if session_row and session_row[0]:
+                        try:
+                            session_data = json.loads(session_row[0])
+                            selected_date = session_data.get("selected_date")
+                            
+                            if selected_date:
+                                cur.execute("""
+                                    SELECT id, title, starts_at, location
+                                    FROM tournaments
+                                    WHERE DATE(starts_at) = %s
+                                      AND starts_at > NOW()
+                                      AND archived_at IS NULL
+                                    ORDER BY starts_at ASC
+                                """, (selected_date,))
+                                tournaments = cur.fetchall()
+                                
+                                buttons = []
+                                for tournament_id, title, starts_at, location in tournaments:
+                                    if starts_at:
+                                        if isinstance(starts_at, datetime):
+                                            if starts_at.tzinfo is None:
+                                                starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                                            else:
+                                                starts_at_utc = starts_at.astimezone(timezone.utc)
+                                            starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                                            time_str = starts_at_msk.strftime("%H:%M")
+                                        else:
+                                            time_str = str(starts_at)
+                                    else:
+                                        time_str = "??:??"
+                                    
+                                    button_text = f"{title[:30]} — {time_str}" if len(title) <= 30 else f"{title[:27]}... — {time_str}"
+                                    buttons.append([InlineKeyboardButton(button_text, callback_data=f"bind_pick_tournament:{tournament_id}")])
+                                
+                                buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:date")])
+                                
+                                keyboard = InlineKeyboardMarkup(buttons)
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text="Выбери турнир:",
+                                    reply_markup=keyboard
+                                )
+                        except:
+                            pass
+                elif back_type.startswith("player:"):
+                    # Back to player selection
+                    tournament_id = int(back_type.split(":")[1])
+                    
+                    cur.execute("""
+                        SELECT p.id, p.full_name
+                        FROM entries e
+                        JOIN players p ON e.player_id = p.id
+                        WHERE e.tournament_id = %s
+                          AND e.active = true
+                        ORDER BY p.full_name ASC
+                    """, (tournament_id,))
+                    players = cur.fetchall()
+                    
+                    page = 0
+                    players_per_page = 10
+                    start_idx = page * players_per_page
+                    end_idx = start_idx + players_per_page
+                    page_players = players[start_idx:end_idx]
+                    
+                    buttons = []
+                    for player_id, full_name in page_players:
+                        buttons.append([InlineKeyboardButton(full_name, callback_data=f"bind_pick_player:{tournament_id}:{player_id}:{page}")])
+                    
+                    nav_buttons = []
+                    if page > 0:
+                        nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"bind_player_page:{tournament_id}:{page-1}"))
+                    if end_idx < len(players):
+                        nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"bind_player_page:{tournament_id}:{page+1}"))
+                    if nav_buttons:
+                        buttons.append(nav_buttons)
+                    
+                    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:tournament")])
+                    buttons.append([InlineKeyboardButton("Отмена", callback_data="bind_back:menu")])
+                    
+                    keyboard = InlineKeyboardMarkup(buttons)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Выбери себя из списка участников:",
+                        reply_markup=keyboard
+                    )
+                
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"BIND BACK ERROR: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+            return {"ok": True}
         
 
     return {"ok": True}
