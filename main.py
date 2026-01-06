@@ -1876,7 +1876,7 @@ Username: {username_str}
                 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="Выбери дату турнира:",
+                    text="Чтобы привязать аккаунт, выбери дату турнира, на который ты УЖЕ записан в Lunda. Это нужно только один раз.",
                     reply_markup=keyboard
                 )
                 
@@ -2000,7 +2000,7 @@ Username: {username_str}
                 return {"ok": True}
             except Exception as e:
                 print(f"PAY CALLBACK ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
         
         # Pay half (50%): pay_half:<entry_id>
@@ -2032,7 +2032,7 @@ Username: {username_str}
                 return {"ok": True}
             except Exception as e:
                 print(f"PAY_HALF ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
         
         # Pay full choose partner: pay_full_choose:<entry_id>
@@ -2103,7 +2103,7 @@ Username: {username_str}
                 return {"ok": True}
             except Exception as e:
                 print(f"PAY_FULL_CHOOSE ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
         
         # Pay full partner: pay_full_partner:<entry_id>:<partner_entry_id>
@@ -2158,7 +2158,7 @@ Username: {username_str}
                 return {"ok": True}
             except Exception as e:
                 print(f"PAY_FULL_PARTNER ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
         
         # Pay cancel: pay_cancel:<entry_id>
@@ -2167,7 +2167,7 @@ Username: {username_str}
                 await bot.answer_callback_query(callback_query["id"], text="Отменено")
                 return {"ok": True}
             except Exception as e:
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
         
         if data.startswith("get_link:"):
@@ -2186,10 +2186,10 @@ Username: {username_str}
                 )
                 return {"ok": True}
             except ValueError as e:
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
             except Exception as e:
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
                 return {"ok": True}
         
         # Bind account flow callbacks
@@ -2223,12 +2223,12 @@ Username: {username_str}
                     # Если не парсится, используем как есть (уже в формате YYYY-MM-DD)
                     pass
                 
-                # Get tournaments for this date
+                # Get tournaments for this date (using MSK timezone to match date selection)
                 cur.execute("""
                     SELECT id, title, starts_at, location
                     FROM tournaments
-                    WHERE DATE(starts_at) = %s::date
-                      AND starts_at > NOW()
+                    WHERE DATE(starts_at AT TIME ZONE 'Europe/Moscow') = %s::date
+                      AND starts_at >= NOW()
                       AND archived_at IS NULL
                     ORDER BY starts_at ASC
                 """, (date_str,))
@@ -2241,12 +2241,11 @@ Username: {username_str}
                     return {"ok": True}
                 
                 # Update session
-                session_data = json.dumps({"selected_date": date_str})
                 cur.execute("""
                     UPDATE telegram_sessions
-                    SET state = 'bind_pick_tournament', data = %s
+                    SET state = 'bind_pick_tournament'
                     WHERE telegram_id = %s
-                """, (session_data, telegram_user_id))
+                """, (telegram_user_id,))
                 conn.commit()
                 
                 # Create buttons for tournaments
@@ -2286,7 +2285,7 @@ Username: {username_str}
                 conn.close()
             except Exception as e:
                 print(f"BIND DATE ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
         # bind_pick_tournament:<tournament_id> - выбор турнира
@@ -2337,12 +2336,11 @@ Username: {username_str}
                     return {"ok": True}
                 
                 # Update session
-                session_data = json.dumps({"selected_tournament_id": tournament_id, "page": 0})
                 cur.execute("""
                     UPDATE telegram_sessions
-                    SET state = 'bind_pick_player', data = %s
+                    SET state = 'bind_pick_player'
                     WHERE telegram_id = %s
-                """, (session_data, telegram_user_id))
+                """, (telegram_user_id,))
                 conn.commit()
                 
                 # Show first page of players
@@ -2382,7 +2380,7 @@ Username: {username_str}
                 conn.close()
             except Exception as e:
                 print(f"BIND TOURNAMENT ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
         # bind_player_page:<tournament_id>:<page> - пагинация участников
@@ -2445,7 +2443,7 @@ Username: {username_str}
                 conn.close()
             except Exception as e:
                 print(f"BIND PAGE ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
         # bind_pick_player:<tournament_id>:<player_id>:<page> - выбор участника
@@ -2495,12 +2493,11 @@ Username: {username_str}
                     starts_at_str = "Не указано"
                 
                 # Update session
-                session_data = json.dumps({"selected_tournament_id": tournament_id, "selected_player_id": player_id})
                 cur.execute("""
                     UPDATE telegram_sessions
-                    SET state = 'bind_confirm', data = %s
+                    SET state = 'bind_confirm'
                     WHERE telegram_id = %s
-                """, (session_data, telegram_user_id))
+                """, (telegram_user_id,))
                 conn.commit()
                 
                 location_str = location or "Не указано"
@@ -2522,7 +2519,7 @@ Username: {username_str}
                 conn.close()
             except Exception as e:
                 print(f"BIND PLAYER ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
         # bind_confirm:<player_id> - подтверждение привязки
@@ -2673,7 +2670,7 @@ Username: {username_str}
                 conn.close()
             except Exception as e:
                 print(f"BIND CONFIRM ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
         # bind_back:* - навигация назад
@@ -2705,7 +2702,7 @@ Username: {username_str}
                     # Back to date selection
                     cur.execute("""
                         UPDATE telegram_sessions
-                        SET state = 'bind_pick_date', data = '{}'
+                        SET state = 'bind_pick_date'
                         WHERE telegram_id = %s
                     """, (telegram_user_id,))
                     conn.commit()
@@ -2734,58 +2731,48 @@ Username: {username_str}
                     keyboard = InlineKeyboardMarkup(buttons)
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="Выбери дату турнира:",
+                        text="Чтобы привязать аккаунт, выбери дату турнира, на который ты УЖЕ записан в Lunda. Это нужно только один раз.",
                         reply_markup=keyboard
                     )
                 elif back_type == "tournament":
-                    # Back to tournament selection - need to get date from session
-                    cur.execute("SELECT data FROM telegram_sessions WHERE telegram_id = %s", (telegram_user_id,))
-                    session_row = cur.fetchone()
+                    # Back to tournament selection - redirect to date selection since we don't store date in session
+                    # User needs to select date again
+                    cur.execute("""
+                        SELECT DISTINCT DATE(starts_at AT TIME ZONE 'Europe/Moscow') AS tournament_date
+                        FROM tournaments
+                        WHERE archived_at IS NULL
+                          AND starts_at >= NOW()
+                        ORDER BY tournament_date ASC
+                        LIMIT 10
+                    """)
+                    date_rows = cur.fetchall()
                     
-                    if session_row and session_row[0]:
-                        try:
-                            session_data = json.loads(session_row[0])
-                            selected_date = session_data.get("selected_date")
+                    if date_rows:
+                        buttons = []
+                        for (date_obj,) in date_rows:
+                            if isinstance(date_obj, (datetime, date)):
+                                date_display = date_obj.strftime("%d.%m.%Y")
+                                date_callback = date_obj.strftime("%Y-%m-%d")
+                            else:
+                                try:
+                                    from dateutil import parser
+                                    date_parsed = parser.parse(str(date_obj))
+                                    date_display = date_parsed.strftime("%d.%m.%Y")
+                                    date_callback = date_parsed.strftime("%Y-%m-%d")
+                                except:
+                                    date_display = str(date_obj)
+                                    date_callback = str(date_obj)
                             
-                            if selected_date:
-                                cur.execute("""
-                                    SELECT id, title, starts_at, location
-                                    FROM tournaments
-                                    WHERE DATE(starts_at) = %s
-                                      AND starts_at > NOW()
-                                      AND archived_at IS NULL
-                                    ORDER BY starts_at ASC
-                                """, (selected_date,))
-                                tournaments = cur.fetchall()
-                                
-                                buttons = []
-                                for tournament_id, title, starts_at, location in tournaments:
-                                    if starts_at:
-                                        if isinstance(starts_at, datetime):
-                                            if starts_at.tzinfo is None:
-                                                starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
-                                            else:
-                                                starts_at_utc = starts_at.astimezone(timezone.utc)
-                                            starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
-                                            time_str = starts_at_msk.strftime("%H:%M")
-                                        else:
-                                            time_str = str(starts_at)
-                                    else:
-                                        time_str = "??:??"
-                                    
-                                    button_text = f"{title[:30]} — {time_str}" if len(title) <= 30 else f"{title[:27]}... — {time_str}"
-                                    buttons.append([InlineKeyboardButton(button_text, callback_data=f"bind_pick_tournament:{tournament_id}")])
-                                
-                                buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:date")])
-                                
-                                keyboard = InlineKeyboardMarkup(buttons)
-                                await bot.send_message(
-                                    chat_id=chat_id,
-                                    text="Выбери турнир:",
-                                    reply_markup=keyboard
-                                )
-                        except:
-                            pass
+                            buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_callback}")])
+                        
+                        buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:menu")])
+                        
+                        keyboard = InlineKeyboardMarkup(buttons)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="Чтобы привязать аккаунт, выбери дату турнира, на который ты УЖЕ записан в Lunda. Это нужно только один раз.",
+                            reply_markup=keyboard
+                        )
                 elif back_type.startswith("player:"):
                     # Back to player selection
                     tournament_id = int(back_type.split(":")[1])
@@ -2832,7 +2819,7 @@ Username: {username_str}
                 conn.close()
             except Exception as e:
                 print(f"BIND BACK ERROR: {str(e)}")
-                await bot.answer_callback_query(callback_query["id"], text=f"Ошибка: {str(e)}")
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
 
