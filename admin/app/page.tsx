@@ -270,6 +270,16 @@ export default function AdminPage() {
                           manual
                         </span>
                       )}
+                      {e.paid_by_entry_id && (
+                        <span className="ml-2 px-1.5 py-0.5 text-xs bg-blue-500 text-white rounded">
+                          Оплачено парой
+                        </span>
+                      )}
+                      {e.paid_for_entry_id && (
+                        <span className="ml-2 px-1.5 py-0.5 text-xs bg-green-500 text-white rounded">
+                          Оплатил за пару
+                        </span>
+                      )}
                     </td>
                     <td className="py-1 px-2 border border-gray-500">
                       {e.telegram_id ? (

@@ -31,6 +31,23 @@ def get_db_conn():
         raise Exception("DATABASE_URL not set")
     return psycopg2.connect(database_url, sslmode="require")
 
+def ensure_conn(conn):
+    """Ensure database connection is alive. Reconnect if needed."""
+    if conn is None or getattr(conn, "closed", 1) != 0:
+        print("DB RECONNECT: Connection closed, reconnecting...")
+        return get_db_conn()
+    return conn
+
+def safe_rollback(conn):
+    """Safely rollback transaction if connection is alive."""
+    if conn and getattr(conn, "closed", 1) == 0:
+        try:
+            conn.rollback()
+        except Exception as e:
+            print(f"WARNING: Rollback failed: {e}")
+    else:
+        print("WARNING: Cannot rollback - connection is closed")
+
 def parse_price(price_str):
     """Parse price from string like '6000 Р за пару' -> 6000. Returns 0 if not found."""
     if not price_str:
@@ -439,88 +456,150 @@ def update_sync_run(conn, sync_run_id, stats, error=None):
     
     conn.commit()
 
-def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats):
-    """Archive tournaments that are not in current JSON (JSON is source of truth). Returns list of archived tournament IDs."""
+def archive_past_tournaments(conn, cutoff_time, stats):
+    """Archive tournaments that are past (starts_at < cutoff_time). One-time operation."""
+    # Ensure connection is alive
+    conn = ensure_conn(conn)
     cur = conn.cursor()
     
-    # Check if required columns exist
-    has_last_seen = check_column_exists(conn, 'tournaments', 'last_seen_in_source')
-    has_archived_at = check_column_exists(conn, 'tournaments', 'archived_at')
-    
-    # If columns don't exist, skip this functionality
-    if not has_last_seen or not has_archived_at:
-        print("WARNING: Required columns (last_seen_in_source, archived_at) not found.")
-        print("Please run migration 004_fix_tournament_archiving.sql first.")
-        return []
-    
-    # Find tournaments that were NOT seen in this run
-    # Archive tournaments where:
-    # - archived_at IS NULL (not already archived)
-    # - last_seen_in_source IS NULL OR last_seen_in_source < run_started_at (not seen in this run)
-    # - id NOT IN processed_tournament_ids (not in current JSON)
-    if processed_tournament_ids:
-        # Use NOT IN for list of IDs
-        placeholders = ','.join(['%s'] * len(processed_tournament_ids))
-        query = f"""
-            SELECT t.id, t.title, t.location, t.starts_at
-            FROM tournaments t
-            WHERE t.archived_at IS NULL
-              AND (t.last_seen_in_source IS NULL OR t.last_seen_in_source < %s)
-              AND t.id NOT IN ({placeholders})
-        """
-        params = [run_started_at] + list(processed_tournament_ids)
-    else:
-        # If no processed tournaments, archive all that weren't seen
-        query = """
-            SELECT t.id, t.title, t.location, t.starts_at
-            FROM tournaments t
-            WHERE t.archived_at IS NULL
-              AND (t.last_seen_in_source IS NULL OR t.last_seen_in_source < %s)
-        """
-        params = [run_started_at]
-    
-    cur.execute(query, params)
-    missing_tournaments = cur.fetchall()
-    
-    archived_ids = []
-    for tournament_id, title, location, starts_at in missing_tournaments:
-        # Archive tournament (don't delete - preserve history)
-        cur.execute("""
-            UPDATE tournaments
-            SET archived_at = NOW()
-            WHERE id = %s AND archived_at IS NULL
-        """, (tournament_id,))
+    try:
+        # Check if archived_at column exists
+        has_archived_at = check_column_exists(conn, 'tournaments', 'archived_at')
         
-        # Check if tournament was actually updated
-        if cur.rowcount > 0:
-            stats['tournaments_archived'] += 1
-            archived_ids.append(tournament_id)
-            print(f"ARCHIVED tournament: id={tournament_id}, title={title}, location={location}")
+        if not has_archived_at:
+            print("WARNING: archived_at column not found. Skipping past tournaments archiving.")
+            return
+        
+        # Find past tournaments that are not yet archived
+        # Convert cutoff_time to UTC for database comparison (PostgreSQL stores timestamptz in UTC)
+        cutoff_utc = cutoff_time.astimezone(timezone.utc)
+        
+        query = """
+            SELECT id, title, location, starts_at
+            FROM tournaments
+            WHERE archived_at IS NULL
+              AND starts_at < %s
+            ORDER BY starts_at DESC
+        """
+        
+        cur.execute(query, (cutoff_utc,))
+        past_tournaments = cur.fetchall()
+        
+        archived_count = 0
+        for tournament_id, title, location, starts_at in past_tournaments:
+            cur.execute("""
+                UPDATE tournaments
+                SET archived_at = NOW()
+                WHERE id = %s AND archived_at IS NULL
+            """, (tournament_id,))
+            
+            if cur.rowcount > 0:
+                archived_count += 1
+                stats['tournaments_archived'] += 1
+        
+        conn.commit()
+        
+        if archived_count > 0:
+            print(f"Archived {archived_count} past tournaments (starts_at < {cutoff_time.strftime('%Y-%m-%d %H:%M')} MSK)")
+        else:
+            print("No past tournaments to archive")
+    finally:
+        cur.close()
+
+def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats):
+    """Archive tournaments that are not in current JSON (JSON is source of truth). Returns list of archived tournament IDs."""
+    # Ensure connection is alive
+    conn = ensure_conn(conn)
+    cur = conn.cursor()
     
-    conn.commit()
-    
-    # Log summary
-    if archived_ids:
-        print(f"\nARCHIVING SUMMARY: {len(archived_ids)} tournaments archived")
-        print(f"Example archived IDs: {archived_ids[:3]}")
-    else:
-        print("\nARCHIVING SUMMARY: No tournaments archived (all present in JSON)")
-    
-    return archived_ids
+    try:
+        # Check if required columns exist
+        has_last_seen = check_column_exists(conn, 'tournaments', 'last_seen_in_source')
+        has_archived_at = check_column_exists(conn, 'tournaments', 'archived_at')
+        
+        # If columns don't exist, skip this functionality
+        if not has_last_seen or not has_archived_at:
+            print("WARNING: Required columns (last_seen_in_source, archived_at) not found.")
+            print("Please run migration 004_fix_tournament_archiving.sql first.")
+            return []
+        
+        # Find tournaments that were NOT seen in this run
+        # Archive tournaments where:
+        # - archived_at IS NULL (not already archived)
+        # - last_seen_in_source IS NULL OR last_seen_in_source < run_started_at (not seen in this run)
+        # - id NOT IN processed_tournament_ids (not in current JSON)
+        if processed_tournament_ids:
+            # Use NOT IN for list of IDs
+            placeholders = ','.join(['%s'] * len(processed_tournament_ids))
+            query = f"""
+                SELECT t.id, t.title, t.location, t.starts_at
+                FROM tournaments t
+                WHERE t.archived_at IS NULL
+                  AND (t.last_seen_in_source IS NULL OR t.last_seen_in_source < %s)
+                  AND t.id NOT IN ({placeholders})
+            """
+            params = [run_started_at] + list(processed_tournament_ids)
+        else:
+            # If no processed tournaments, archive all that weren't seen
+            query = """
+                SELECT t.id, t.title, t.location, t.starts_at
+                FROM tournaments t
+                WHERE t.archived_at IS NULL
+                  AND (t.last_seen_in_source IS NULL OR t.last_seen_in_source < %s)
+            """
+            params = [run_started_at]
+        
+        cur.execute(query, params)
+        missing_tournaments = cur.fetchall()
+        
+        archived_ids = []
+        for tournament_id, title, location, starts_at in missing_tournaments:
+            # Archive tournament (don't delete - preserve history)
+            cur.execute("""
+                UPDATE tournaments
+                SET archived_at = NOW()
+                WHERE id = %s AND archived_at IS NULL
+            """, (tournament_id,))
+            
+            # Check if tournament was actually updated
+            if cur.rowcount > 0:
+                stats['tournaments_archived'] += 1
+                archived_ids.append(tournament_id)
+                print(f"ARCHIVED tournament: id={tournament_id}, title={title}, location={location}")
+        
+        conn.commit()
+        
+        # Log summary
+        if archived_ids:
+            print(f"\nARCHIVING SUMMARY: {len(archived_ids)} tournaments archived")
+            print(f"Example archived IDs: {archived_ids[:3]}")
+        else:
+            print("\nARCHIVING SUMMARY: No tournaments archived (all present in JSON)")
+        
+        return archived_ids
+    finally:
+        cur.close()
 
 def main():
     """Main import function."""
+    # Log run start
+    pid = os.getpid()
+    now_local = datetime.now(MSK_TZ)
+    print("="*50)
+    print(f"RUN START: PID={pid}, Time={now_local.strftime('%Y-%m-%d %H:%M:%S %z')} MSK")
+    print("="*50)
+    
     # Get paths from env
     database_url = os.getenv("DATABASE_URL")
     json_path = os.getenv("LUNDA_JSON_PATH")
     
     if not database_url:
         print("ERROR: DATABASE_URL not set")
-        return 1
+        return 0  # Exit 0 for launchd
     
     if not json_path:
         print("ERROR: LUNDA_JSON_PATH not set")
-        return 1
+        return 0  # Exit 0 for launchd
     
     # Load JSON
     print(f"Loading JSON from: {json_path}")
@@ -529,16 +608,16 @@ def main():
             data = json.load(f)
     except FileNotFoundError:
         print(f"ERROR: File not found: {json_path}")
-        return 1
+        return 0  # Exit 0 for launchd
     except json.JSONDecodeError as e:
         print(f"ERROR: Invalid JSON: {e}")
-        return 1
+        return 0  # Exit 0 for launchd
     
     # Get tournaments dict/list
     tournaments_raw = data.get('tournaments', {})
     if not tournaments_raw:
         print("ERROR: No 'tournaments' key in JSON")
-        return 1
+        return 0  # Exit 0 for launchd
     
     # Debug output
     print(f"DEBUG: data['tournaments'] type: {type(tournaments_raw).__name__}")
@@ -550,7 +629,7 @@ def main():
         tournaments_list = tournaments_raw
     else:
         print(f"ERROR: Unexpected type for tournaments: {type(tournaments_raw)}")
-        return 1
+        return 0  # Exit 0 for launchd
     
     print(f"Found {len(tournaments_list)} tournaments in JSON")
     
@@ -558,11 +637,12 @@ def main():
     global_last_updated = data.get('last_updated')
     
     # Connect to DB
+    conn = None
     try:
         conn = get_db_conn()
     except Exception as e:
         print(f"ERROR: Failed to connect to database: {e}")
-        return 1
+        return 0  # Exit 0 for launchd
     
     # Create sync run record
     sync_run_id = None
@@ -581,6 +661,13 @@ def main():
         # Continue anyway
         run_started_at = datetime.now()
     
+    # Calculate cutoff time: now_msk - grace (grace = 6 hours)
+    now_msk = datetime.now(MSK_TZ)
+    grace_hours = 6
+    cutoff_time = now_msk - timedelta(hours=grace_hours)
+    print(f"Cutoff time (MSK): {cutoff_time.strftime('%Y-%m-%d %H:%M:%S %z')}")
+    print(f"Tournaments with starts_at < {cutoff_time.strftime('%Y-%m-%d %H:%M')} MSK will be skipped")
+    
     # Statistics
     stats = {
         'tournaments_upsert': 0,
@@ -590,6 +677,7 @@ def main():
         'entries_deleted': 0,
         'entries_inactivated': 0,
         'tournaments_archived': 0,
+        'tournaments_skipped_past': 0,
         'tournaments_deleted': 0
     }
     
@@ -597,46 +685,105 @@ def main():
     processed_tournament_ids = set()
     archived_tournament_ids = []
     
-    # Process each tournament
+    # Process each tournament (only future tournaments)
+    # Each tournament in separate transaction for resilience
     error_occurred = None
-    try:
-        for tournament_data in tournaments_list:
-            tournament_info = tournament_data.get('tournament', {})
-            title = tournament_info.get('title', 'Unknown')
-            location = tournament_info.get('location', 'Unknown')
-            print(f"Processing tournament: {title} at {location}")
+    tournament_errors = []
+    
+    for tournament_data in tournaments_list:
+        tournament_info = tournament_data.get('tournament', {})
+        title = tournament_info.get('title', 'Unknown')
+        location = tournament_info.get('location', 'Unknown')
+        
+        # Get and normalize starts_at
+        starts_at_raw = tournament_data.get('start_datetime')
+        starts_at = normalize_msk(starts_at_raw)
+        
+        # Skip past tournaments (before cutoff)
+        if starts_at is None:
+            print(f"SKIPPED tournament (no starts_at): {title} at {location}")
+            stats['tournaments_skipped_past'] += 1
+            continue
+        
+        if starts_at < cutoff_time:
+            print(f"SKIPPED past tournament: {title} at {location} (starts_at={starts_at.strftime('%Y-%m-%d %H:%M')} MSK)")
+            stats['tournaments_skipped_past'] += 1
+            continue
+        
+        # Process only future tournaments - each in separate transaction
+        print(f"Processing tournament: {title} at {location} (starts_at={starts_at.strftime('%Y-%m-%d %H:%M')} MSK)")
+        
+        # Ensure connection is alive before processing
+        try:
+            conn = ensure_conn(conn)
             process_tournament(conn, tournament_data, stats, global_last_updated, processed_tournament_ids)
-        
-        # Process tournaments that are missing from JSON
-        if run_started_at:
-            print("\nProcessing missing tournaments (not in JSON)...")
-            archived_tournament_ids = process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats)
+            conn.commit()
+        except Exception as e:
+            # Tournament error - log and continue
+            err_msg = str(e)
+            tournament_errors.append(f"{title} ({starts_at.strftime('%Y-%m-%d %H:%M') if starts_at else 'no date'}): {err_msg}")
+            print(f"TOURNAMENT ERROR: title={title}, starts_at={starts_at.strftime('%Y-%m-%d %H:%M') if starts_at else 'None'}, err={err_msg}")
+            safe_rollback(conn)
+            # Continue with next tournament
+            continue
+    
+    # Archive past tournaments (one-time, based on cutoff)
+    try:
+        print("\nArchiving past tournaments (starts_at < cutoff)...")
+        conn = ensure_conn(conn)
+        archive_past_tournaments(conn, cutoff_time, stats)
     except Exception as e:
-        error_occurred = str(e)
-        print(f"ERROR during processing: {error_occurred}")
-        import traceback
-        traceback.print_exc()
-        conn.rollback()
-        archived_tournament_ids = []
-    finally:
-        # Update sync run with statistics
-        if sync_run_id:
-            try:
-                update_sync_run(conn, sync_run_id, stats, error_occurred)
-                print(f"Updated sync run: id={sync_run_id}")
-            except Exception as e:
-                print(f"WARNING: Failed to update sync run: {e}")
-        
-        conn.close()
+        print(f"ERROR archiving past tournaments: {e}")
+        if not error_occurred:
+            error_occurred = f"Archive error: {str(e)}"
+    
+    # Process tournaments that are missing from JSON
+    archived_tournament_ids = []
+    if run_started_at:
+        try:
+            print("\nProcessing missing tournaments (not in JSON)...")
+            conn = ensure_conn(conn)
+            archived_tournament_ids = process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats)
+        except Exception as e:
+            print(f"ERROR processing missing tournaments: {e}")
+            if not error_occurred:
+                error_occurred = f"Missing tournaments error: {str(e)}"
+    
+    # Collect tournament errors into main error_occurred
+    if tournament_errors:
+        if error_occurred:
+            error_occurred += f"; Tournament errors: {len(tournament_errors)}"
+        else:
+            error_occurred = f"Tournament errors: {len(tournament_errors)}"
+        print(f"\nTotal tournament errors: {len(tournament_errors)}")
+        if len(tournament_errors) <= 5:
+            for err in tournament_errors:
+                print(f"  - {err}")
+    # Update sync run with statistics
+    if sync_run_id:
+        try:
+            conn = ensure_conn(conn)
+            update_sync_run(conn, sync_run_id, stats, error_occurred)
+            print(f"Updated sync run: id={sync_run_id}")
+        except Exception as e:
+            print(f"WARNING: Failed to update sync run: {e}")
+    
+    # Close connection safely
+    if conn and getattr(conn, "closed", 1) == 0:
+        try:
+            conn.close()
+        except Exception as e:
+            print(f"WARNING: Failed to close connection: {e}")
     
     # Print statistics
     print("\n" + "="*50)
     print("IMPORT STATISTICS")
     print("="*50)
     print(f"Tournaments UPSERT: {stats['tournaments_upsert']}")
+    print(f"Skipped past tournaments: {stats['tournaments_skipped_past']}")
     print(f"Tournaments ARCHIVED: {stats['tournaments_archived']}")
     if stats['tournaments_archived'] > 0:
-        print(f"  -> {stats['tournaments_archived']} tournaments were archived (not in current JSON)")
+        print(f"  -> {stats['tournaments_archived']} tournaments were archived (past or not in current JSON)")
         if archived_tournament_ids:
             print(f"  -> Example archived tournament IDs: {archived_tournament_ids[:3]}")
     if stats['tournaments_deleted'] > 0:
@@ -650,35 +797,74 @@ def main():
         print(f"ERROR: {error_occurred}")
     print("="*50)
     
-    # Auto-trigger Telegram notifications if import was successful
-    if not error_occurred:
-        print("\n" + "="*50)
-        print("AUTO-TRIGGERING TELEGRAM NOTIFICATIONS")
-        print("="*50)
-        try:
-            backend_base_url = os.getenv("BACKEND_BASE_URL", "https://padel-payments.onrender.com")
-            endpoint_url = f"{backend_base_url}/admin/process-new-entries?limit=500"
-            
-            print(f"POST {endpoint_url}")
-            response = requests.post(endpoint_url, timeout=30)
-            
-            print(f"Status: {response.status_code}")
-            if response.status_code == 200:
-                result = response.json()
-                print(f"Response: processed={result.get('processed', 0)}, notified={result.get('notified', 0)}")
-            else:
-                print(f"Error response: {response.text}")
-        except requests.exceptions.Timeout:
-            print("ERROR: Request timeout (30s)")
-        except requests.exceptions.RequestException as e:
-            print(f"ERROR: Request failed: {e}")
-        except Exception as e:
-            print(f"ERROR: Unexpected error: {e}")
-            import traceback
-            traceback.print_exc()
-        print("="*50)
+    # Auto-trigger Telegram notifications in batches
+    # Wrap in try/except to not break import
+    print("\n" + "="*50)
+    print("AUTO-TRIGGERING TELEGRAM NOTIFICATIONS")
+    print("="*50)
     
-    # Always return 0 (success) even if notification POST failed (for cron)
+    backend_base_url = os.getenv("BACKEND_BASE_URL", "https://padel-payments.onrender.com")
+    batch_limit = 500
+    max_iterations = 50
+    total_processed = 0
+    total_notified = 0
+    iteration = 0
+    
+    print(f"AUTO TG: start batching, limit={batch_limit}")
+    
+    try:
+        while iteration < max_iterations:
+            iteration += 1
+            endpoint_url = f"{backend_base_url}/admin/process-new-entries?limit={batch_limit}"
+            
+            try:
+                response = requests.post(endpoint_url, timeout=120)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    processed = result.get('processed', 0)
+                    notified = result.get('notified', 0)
+                    total_processed += processed
+                    total_notified += notified
+                    
+                    print(f"AUTO TG: iter={iteration} status={response.status_code} processed={processed} notified={notified}")
+                    
+                    # If no entries processed, we're done
+                    if processed == 0:
+                        break
+                else:
+                    print(f"AUTO TG: iter={iteration} status={response.status_code} error={response.text[:100]}")
+                    # On error, stop batching (but don't fail import)
+                    break
+                    
+            except requests.exceptions.Timeout:
+                print(f"AUTO TG: iter={iteration} ERROR: Request timeout (120s)")
+                # Stop batching on timeout
+                break
+            except requests.exceptions.RequestException as e:
+                print(f"AUTO TG: iter={iteration} ERROR: Request failed: {e}")
+                # Stop batching on request error
+                break
+            except Exception as e:
+                print(f"AUTO TG: iter={iteration} ERROR: Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
+                # Stop batching on unexpected error
+                break
+        
+        if iteration >= max_iterations:
+            print(f"AUTO TG: WARNING: Reached max_iterations={max_iterations}, stopping")
+        
+        print(f"AUTO TG: done, total_processed={total_processed}, total_notified={total_notified}, iters={iteration}")
+        
+    except Exception as e:
+        print(f"ERROR: Unexpected error in notification batching: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("="*50)
+    
+    # Always return 0 (success) for launchd - errors are logged but don't fail the import
     return 0
 
 if __name__ == "__main__":

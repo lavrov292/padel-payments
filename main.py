@@ -133,10 +133,15 @@ def db_check():
         return {"db": "error", "reason": str(e)}
 
 @app.get("/p/e/{entry_id}")
-def payment_entry_link(entry_id: int, pay: str = Query("default", description="Payment mode: 'half' for 50%, 'full' for 100%, 'default' for auto")):
+def payment_entry_link(
+    entry_id: int, 
+    pay: str = Query("default", description="Payment mode: 'half' for 50%, 'full' for 100%, 'default' for auto"),
+    partner_entry_id: int = Query(None, description="Partner entry ID for pair payment (when pay=full)")
+):
     """
     Вечная ссылка на оплату entry. Проверяет статус платежа и создает новый при необходимости.
     Query param 'pay': 'half' (50%), 'full' (100%), 'default' (auto based on tournament_type)
+    Query param 'partner_entry_id': ID партнёра для оплаты за пару (только при pay=full)
     """
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
@@ -159,7 +164,8 @@ def payment_entry_link(entry_id: int, pay: str = Query("default", description="P
                 t.title,
                 t.starts_at,
                 t.tournament_type,
-                p.full_name
+                p.full_name,
+                e.tournament_id
             FROM entries e
             JOIN tournaments t ON e.tournament_id = t.id
             JOIN players p ON e.player_id = p.id
@@ -174,7 +180,7 @@ def payment_entry_link(entry_id: int, pay: str = Query("default", description="P
             conn.close()
             return HTMLResponse(content="<html><body>Запись не найдена</body></html>", status_code=404)
         
-        payment_status, payment_id, payment_url, price_rub, title, starts_at, tournament_type, full_name = row
+        payment_status, payment_id, payment_url, price_rub, title, starts_at, tournament_type, full_name, tournament_id = row
         
         # Если уже оплачено
         if payment_status == 'paid':
@@ -205,22 +211,37 @@ def payment_entry_link(entry_id: int, pay: str = Query("default", description="P
                 payment_id = None
         
         # Если платеж невалиден или payment_id пустой - создаем новый
-        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}")
+        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}, partner_entry_id={partner_entry_id}, partner_entry_id_valid={partner_entry_id_valid}")
         
-        # Calculate payment amount based on tournament type and pay parameter
-        if tournament_type == 'team':
+        # Determine payment scope and amount
+        payment_scope = 'self'
+        paid_for_entry_id_to_save = None
+        
+        if tournament_type == 'team' and pay == 'full' and partner_entry_id_valid is not None:
+            # Team tournament: 100% (full pair payment)
+            payment_amount = float(price_rub)
+            payment_scope = 'pair'
+            paid_for_entry_id_to_save = partner_entry_id_valid
+        elif tournament_type == 'team':
             if pay == 'full':
-                # Team tournament: 100% (full pair payment)
+                # Team tournament: 100% (full pair payment without partner specified - legacy)
                 payment_amount = float(price_rub)
+                payment_scope = 'pair'
+                # No partner specified, so paid_for_entry_id stays NULL
             elif pay == 'half':
                 # Team tournament: 50% (single person payment)
                 payment_amount = float(price_rub) / 2
+                payment_scope = 'self'
             else:
                 # Default for team: 50%
                 payment_amount = float(price_rub) / 2
+                payment_scope = 'self'
         else:
             # Personal tournament: always 100%
             payment_amount = float(price_rub)
+            payment_scope = 'self'
+        
+        print(f"PAYMENT SCOPE DETERMINED: payment_scope={payment_scope}, paid_for_entry_id={paid_for_entry_id_to_save}, payment_amount={payment_amount}")
         
         # Round to 2 decimal places (YooKassa requires .2f format)
         payment_amount = round(payment_amount, 2)
@@ -264,23 +285,34 @@ def payment_entry_link(entry_id: int, pay: str = Query("default", description="P
             "expires_at": expires_at_str
         }
         
+        print(f"BEFORE Payment.create:")
+        print(f"  entry_id={entry_id}")
+        print(f"  pay={pay}")
+        print(f"  partner_entry_id={partner_entry_id}")
+        print(f"  partner_entry_id_valid={partner_entry_id_valid}")
+        print(f"  computed payment_scope={payment_scope}")
+        print(f"  paid_for_entry_id={paid_for_entry_id_to_save}")
+        print(f"  payment_amount={payment_amount:.2f}")
         print(f"PAYMENT CREATE PAYLOAD: entry_id={entry_id}, tournament_type={tournament_type}, amount={payment_amount:.2f}, payload={payment_data}")
         payment = Payment.create(payment_data, idempotence_key)
         
         new_payment_id = payment.id
         new_confirmation_url = payment.confirmation.confirmation_url
         
-        print(f"PAYMENT CREATED: payment_id={new_payment_id}, confirmation_url={new_confirmation_url}")
+        print(f"PAYMENT CREATED: payment_id={new_payment_id}, confirmation_url={new_confirmation_url}, payment_scope={payment_scope}, partner_entry_id={partner_entry_id_valid}")
         
-        # Сохраняем payment_id и payment_url в entries
+        # Сохраняем payment_id, payment_url, payment_scope и paid_for_entry_id в entries
         update_query = """
             UPDATE entries
             SET payment_id = %s,
-                payment_url = %s
+                payment_url = %s,
+                payment_scope = %s,
+                paid_for_entry_id = %s
             WHERE id = %s
         """
         
-        cur.execute(update_query, (new_payment_id, new_confirmation_url, entry_id))
+        print(f"UPDATING ENTRY: entry_id={entry_id}, payment_scope={payment_scope}, paid_for_entry_id={paid_for_entry_id_to_save}")
+        cur.execute(update_query, (new_payment_id, new_confirmation_url, payment_scope, paid_for_entry_id_to_save, entry_id))
         conn.commit()
         
         cur.close()
@@ -708,30 +740,104 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 conn = psycopg2.connect(database_url, sslmode="require")
                 cur = conn.cursor()
                 
-                # Update payment status and paid_amount_rub for all entries with this payment_id
-                # (может быть один entry для personal или два для team)
+                # First, get payer entry info (entry with this payment_id)
+                fetch_payer_query = """
+                    SELECT 
+                        id,
+                        payment_scope,
+                        paid_for_entry_id,
+                        payment_status
+                    FROM entries
+                    WHERE payment_id = %s
+                    LIMIT 1
+                """
+                cur.execute(fetch_payer_query, (payment_id,))
+                payer_row = cur.fetchone()
+                
+                if not payer_row:
+                    cur.close()
+                    conn.close()
+                    print(f"WARNING: No entry found with payment_id={payment_id}")
+                    return {"ok": True}
+                
+                payer_entry_id, payment_scope, paid_for_entry_id, payer_status = payer_row
+                
+                # If both entries already paid, just return ok (idempotent)
+                if payer_status == 'paid' and paid_for_entry_id:
+                    cur.execute("SELECT payment_status FROM entries WHERE id = %s", (paid_for_entry_id,))
+                    partner_status_row = cur.fetchone()
+                    if partner_status_row and partner_status_row[0] == 'paid':
+                        cur.close()
+                        conn.close()
+                        print(f"INFO: Both entries already paid for payment_id={payment_id}")
+                        return {"ok": True}
+                
+                # Update payer entry
                 if amount_value is not None:
-                    update_query = """
+                    update_payer_query = """
                         UPDATE entries
                         SET payment_status = 'paid', 
                             paid_at = NOW(),
                             paid_amount_rub = %s
-                        WHERE payment_id = %s
+                        WHERE id = %s AND payment_status != 'paid'
                     """
-                    cur.execute(update_query, (amount_value, payment_id))
+                    cur.execute(update_payer_query, (amount_value, payer_entry_id))
                 else:
-                    update_query = """
+                    update_payer_query = """
                         UPDATE entries
-                        SET payment_status = 'paid', paid_at = NOW()
-                        WHERE payment_id = %s
+                        SET payment_status = 'paid', 
+                            paid_at = NOW()
+                        WHERE id = %s AND payment_status != 'paid'
                     """
-                    cur.execute(update_query, (payment_id,))
+                    cur.execute(update_payer_query, (payer_entry_id,))
+                
+                # If this is a pair payment, update partner entry
+                if payment_scope == 'pair' and paid_for_entry_id:
+                    # Check partner entry exists and is not already paid
+                    cur.execute("""
+                        SELECT id, payment_status
+                        FROM entries
+                        WHERE id = %s
+                    """, (paid_for_entry_id,))
+                    partner_row = cur.fetchone()
+                    
+                    if partner_row:
+                        partner_id, partner_status = partner_row
+                        if partner_status != 'paid':
+                            # Update partner entry
+                            if amount_value is not None:
+                                # For pair payment, partner gets half amount (or full, depending on logic)
+                                # We'll use the same amount for now, but mark it as paid by payer
+                                update_partner_query = """
+                                    UPDATE entries
+                                    SET payment_status = 'paid',
+                                        paid_at = NOW(),
+                                        paid_by_entry_id = %s,
+                                        paid_amount_rub = %s
+                                    WHERE id = %s
+                                """
+                                cur.execute(update_partner_query, (payer_entry_id, amount_value, partner_id))
+                            else:
+                                update_partner_query = """
+                                    UPDATE entries
+                                    SET payment_status = 'paid',
+                                        paid_at = NOW(),
+                                        paid_by_entry_id = %s
+                                    WHERE id = %s
+                                """
+                                cur.execute(update_partner_query, (payer_entry_id, partner_id))
+                        else:
+                            print(f"WARNING: Partner entry {partner_id} already paid, skipping update")
+                    else:
+                        print(f"WARNING: Partner entry {paid_for_entry_id} not found, payer entry still marked as paid")
                 
                 conn.commit()
                 
-                # Fetch all entries with this payment_id (for team payments there will be 2)
+                # Fetch all entries that should be notified:
+                # 1. Entry with this payment_id (payer)
+                # 2. Partner entry if this is a pair payment (via paid_for_entry_id)
                 fetch_query = """
-                    SELECT 
+                    SELECT DISTINCT
                         e.id,
                         p.telegram_id,
                         t.title,
@@ -740,14 +846,18 @@ async def yookassa_webhook(payload: dict = Body(...)):
                         t.tournament_type,
                         t.location,
                         e.paid_amount_rub,
-                        COUNT(*) OVER (PARTITION BY e.payment_id) as payment_count
+                        e.paid_by_entry_id,
+                        e.paid_for_entry_id
                     FROM entries e
                     JOIN players p ON e.player_id = p.id
                     JOIN tournaments t ON e.tournament_id = t.id
                     WHERE e.payment_id = %s
+                       OR (e.paid_by_entry_id IN (
+                           SELECT id FROM entries WHERE payment_id = %s
+                       ))
                 """
                 
-                cur.execute(fetch_query, (payment_id,))
+                cur.execute(fetch_query, (payment_id, payment_id))
                 rows = cur.fetchall()
                 
                 cur.close()
@@ -756,7 +866,7 @@ async def yookassa_webhook(payload: dict = Body(...)):
                 # Send Telegram notifications to all players whose status became paid
                 if rows and bot is not None:
                     for row in rows:
-                        entry_id, telegram_id, tournament_title, starts_at, price_rub, tournament_type, location, paid_amount_rub, payment_count = row
+                        entry_id, telegram_id, tournament_title, starts_at, price_rub, tournament_type, location, paid_amount_rub, paid_by_entry_id, paid_for_entry_id = row
                         if telegram_id:
                             try:
                                 # Format starts_at (without MSK suffix)
@@ -777,25 +887,48 @@ async def yookassa_webhook(payload: dict = Body(...)):
                                 # Priority: paid_amount_rub > calculated from tournament type
                                 if paid_amount_rub is not None:
                                     actual_amount = int(paid_amount_rub)
-                                elif tournament_type == 'team' and payment_count == 1:
+                                elif tournament_type == 'team' and not paid_by_entry_id:
                                     # Single team payment (half)
                                     actual_amount = int(price_rub / 2)
                                 else:
                                     # Personal or full team payment
                                     actual_amount = int(price_rub)
                                 
-                                # Check if this is a team payment (2 entries with same payment_id)
-                                if payment_count == 2 and tournament_type == 'team':
-                                    # Team payment - find partner
-                                    # Get partner info
+                                # Check if this is a pair payment
+                                if paid_by_entry_id:
+                                    # Partner entry - someone paid for them
+                                    # Get payer name
                                     conn2 = psycopg2.connect(database_url, sslmode="require")
                                     cur2 = conn2.cursor()
                                     cur2.execute("""
                                         SELECT p2.full_name
                                         FROM entries e2
                                         JOIN players p2 ON e2.player_id = p2.id
-                                        WHERE e2.payment_id = %s AND e2.id != %s
-                                    """, (payment_id, entry_id))
+                                        WHERE e2.id = %s
+                                    """, (paid_by_entry_id,))
+                                    payer_row = cur2.fetchone()
+                                    payer_name = payer_row[0] if payer_row else "партнер"
+                                    cur2.close()
+                                    conn2.close()
+                                    
+                                    message = f"""✅ Оплата получена!
+
+Турнир: {tournament_title}
+Место: {location or 'Не указано'}
+Время: {starts_at_str}
+
+Партнер {payer_name} оплатил за пару."""
+                                elif paid_for_entry_id:
+                                    # Payer entry - they paid for partner
+                                    # Get partner name
+                                    conn2 = psycopg2.connect(database_url, sslmode="require")
+                                    cur2 = conn2.cursor()
+                                    cur2.execute("""
+                                        SELECT p2.full_name
+                                        FROM entries e2
+                                        JOIN players p2 ON e2.player_id = p2.id
+                                        WHERE e2.id = %s
+                                    """, (paid_for_entry_id,))
                                     partner_row = cur2.fetchone()
                                     partner_name = partner_row[0] if partner_row else "партнер"
                                     cur2.close()
@@ -806,8 +939,9 @@ async def yookassa_webhook(payload: dict = Body(...)):
 Турнир: {tournament_title}
 Место: {location or 'Не указано'}
 Время: {starts_at_str}
+Сумма: {actual_amount} ₽
 
-Партнер {partner_name} оплатил за пару."""
+Вы оплатили за пару (партнер: {partner_name})."""
                                 else:
                                     # Personal payment or single team payment
                                     message = f"""✅ Оплата получена!
@@ -1824,7 +1958,8 @@ Username: {username_str}
                 else:
                     partner_name = "Партнер"
                 
-                payment_link = f"{public_base_url}/p/e/{entry_id}?pay=full"
+                # Include partner_entry_id in payment link for pair payment
+                payment_link = f"{public_base_url}/p/e/{entry_id}?pay=full&partner_entry_id={partner_entry_id}"
                 
                 keyboard = InlineKeyboardMarkup([
                     [
