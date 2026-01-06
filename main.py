@@ -51,6 +51,50 @@ def tg_id_str(from_user):
         return str(from_user["id"])
     return None
 
+def fmt_date_ru(date_input) -> tuple[str, str]:
+    """
+    Format date for Russian locale display and ISO callback.
+    Returns: (display_text: str, iso_date: str)
+    - display_text: DD.MM.YYYY format for button text
+    - iso_date: YYYY-MM-DD format for callback_data
+    """
+    if isinstance(date_input, (datetime, date)):
+        display_text = date_input.strftime("%d.%m.%Y")
+        iso_date = date_input.strftime("%Y-%m-%d")
+        return (display_text, iso_date)
+    elif isinstance(date_input, str):
+        # Try to parse string date
+        try:
+            from dateutil import parser
+            date_parsed = parser.parse(date_input)
+            display_text = date_parsed.strftime("%d.%m.%Y")
+            iso_date = date_parsed.strftime("%Y-%m-%d")
+            return (display_text, iso_date)
+        except:
+            # If parsing fails, assume it's already in ISO format
+            try:
+                # Try to parse YYYY-MM-DD
+                if len(date_input) == 10 and date_input.count('-') == 2:
+                    parts = date_input.split('-')
+                    if len(parts) == 3:
+                        display_text = f"{parts[2]}.{parts[1]}.{parts[0]}"
+                        iso_date = date_input
+                        return (display_text, iso_date)
+            except:
+                pass
+            # Fallback: return as-is
+            return (str(date_input), str(date_input))
+    else:
+        # For other types, try to convert to string and parse
+        try:
+            from dateutil import parser
+            date_parsed = parser.parse(str(date_input))
+            display_text = date_parsed.strftime("%d.%m.%Y")
+            iso_date = date_parsed.strftime("%Y-%m-%d")
+            return (display_text, iso_date)
+        except:
+            return (str(date_input), str(date_input))
+
 def set_support_mode(telegram_id, enabled):
     """Set support_mode for telegram_id."""
     conn = get_db_conn()
@@ -1851,23 +1895,8 @@ Username: {username_str}
                 # Create buttons for dates
                 buttons = []
                 for (date_obj,) in date_rows:
-                    # Format date for display: DD.MM.YYYY
-                    # date_obj from PostgreSQL DATE() is a date or datetime object
-                    if isinstance(date_obj, (datetime, date)):
-                        date_display = date_obj.strftime("%d.%m.%Y")
-                        date_callback = date_obj.strftime("%Y-%m-%d")
-                    else:
-                        # If it's a string or other type, try to parse it
-                        try:
-                            from dateutil import parser
-                            date_parsed = parser.parse(str(date_obj))
-                            date_display = date_parsed.strftime("%d.%m.%Y")
-                            date_callback = date_parsed.strftime("%Y-%m-%d")
-                        except:
-                            date_display = str(date_obj)
-                            date_callback = str(date_obj)
-                    
-                    buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_callback}")])
+                    date_display, date_iso = fmt_date_ru(date_obj)
+                    buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_iso}")])
                 
                 # Add Cancel button
                 buttons.append([InlineKeyboardButton("Отмена", callback_data="bind_back:menu")])
@@ -2707,12 +2736,12 @@ Username: {username_str}
                     """, (telegram_user_id,))
                     conn.commit()
                     
-                    # Get dates again
+                    # Get dates again (using MSK timezone to match date selection)
                     cur.execute("""
-                        SELECT DISTINCT DATE(starts_at) as tournament_date
+                        SELECT DISTINCT DATE(starts_at AT TIME ZONE 'Europe/Moscow') AS tournament_date
                         FROM tournaments
-                        WHERE starts_at > NOW()
-                          AND archived_at IS NULL
+                        WHERE archived_at IS NULL
+                          AND starts_at >= NOW()
                         ORDER BY tournament_date ASC
                         LIMIT 10
                     """)
@@ -2720,11 +2749,8 @@ Username: {username_str}
                     
                     buttons = []
                     for (date_obj,) in date_rows:
-                        if isinstance(date_obj, datetime):
-                            date_str = date_obj.strftime("%d.%m.%Y")
-                        else:
-                            date_str = str(date_obj)
-                        buttons.append([InlineKeyboardButton(date_str, callback_data=f"bind_date:{date_obj}")])
+                        date_display, date_iso = fmt_date_ru(date_obj)
+                        buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_iso}")])
                     
                     buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:menu")])
                     
@@ -2750,20 +2776,8 @@ Username: {username_str}
                     if date_rows:
                         buttons = []
                         for (date_obj,) in date_rows:
-                            if isinstance(date_obj, (datetime, date)):
-                                date_display = date_obj.strftime("%d.%m.%Y")
-                                date_callback = date_obj.strftime("%Y-%m-%d")
-                            else:
-                                try:
-                                    from dateutil import parser
-                                    date_parsed = parser.parse(str(date_obj))
-                                    date_display = date_parsed.strftime("%d.%m.%Y")
-                                    date_callback = date_parsed.strftime("%Y-%m-%d")
-                                except:
-                                    date_display = str(date_obj)
-                                    date_callback = str(date_obj)
-                            
-                            buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_callback}")])
+                            date_display, date_iso = fmt_date_ru(date_obj)
+                            buttons.append([InlineKeyboardButton(date_display, callback_data=f"bind_date:{date_iso}")])
                         
                         buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="bind_back:menu")])
                         
