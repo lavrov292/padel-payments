@@ -159,12 +159,14 @@ def payment_entry_link(
         conn = psycopg2.connect(database_url, sslmode="require")
         cur = conn.cursor()
         
-        # Читаем entry + tournament + player из БД
+        # Читаем entry + tournament + player из БД (включая payment_scope и paid_for_entry_id)
         query = """
             SELECT 
                 e.payment_status,
                 e.payment_id,
                 e.payment_url,
+                e.payment_scope,
+                e.paid_for_entry_id,
                 t.price_rub,
                 t.title,
                 t.starts_at,
@@ -185,7 +187,7 @@ def payment_entry_link(
             conn.close()
             return HTMLResponse(content="<html><body>Запись не найдена</body></html>", status_code=404)
         
-        payment_status, payment_id, payment_url, price_rub, title, starts_at, tournament_type, full_name, tournament_id = row
+        payment_status, payment_id, payment_url, existing_payment_scope, existing_paid_for_entry_id, price_rub, title, starts_at, tournament_type, full_name, tournament_id = row
         
         # Если уже оплачено
         if payment_status == 'paid':
@@ -193,29 +195,7 @@ def payment_entry_link(
             conn.close()
             return HTMLResponse(content="<html><body><h1>✅ Уже оплачено</h1></body></html>")
         
-        # Если есть payment_id, проверяем статус в YooKassa
-        if payment_id:
-            try:
-                print(f"PAYMENT CHECK: entry_id={entry_id}, payment_id={payment_id}")
-                payment = Payment.find_one(payment_id)
-                print(f"PAYMENT STATUS: {payment.status}")
-                
-                # Если платеж pending и есть confirmation_url - редирект
-                if payment.status == 'pending' and payment.confirmation and payment.confirmation.confirmation_url:
-                    cur.close()
-                    conn.close()
-                    print(f"REDIRECT: using existing payment {payment_id}")
-                    return RedirectResponse(url=payment.confirmation.confirmation_url, status_code=302)
-                else:
-                    # Платеж не pending (succeeded/canceled/expired) - считаем невалидным
-                    print(f"PAYMENT INVALID: status={payment.status}, creating new")
-                    payment_id = None
-            except Exception as e:
-                # Платеж не найден или ошибка - считаем невалидным
-                print(f"PAYMENT ERROR: {str(e)}, creating new")
-                payment_id = None
-        
-        # Валидация partner_entry_id из query параметров
+        # Валидация partner_entry_id из query параметров (делаем ДО проверки существующего платежа)
         partner_entry_id_int = None
         partner_entry = None
         
@@ -267,36 +247,95 @@ def payment_entry_link(
                 "tournament_id": partner_tournament_id
             }
         
-        # Если платеж невалиден или payment_id пустой - создаем новый
-        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}, partner_entry_id={partner_entry_id_int}")
+        # Рассчитываем желаемый контекст оплаты (desired_scope и amount)
+        desired_scope = 'self'
+        desired_paid_for_entry_id = None
+        desired_amount = None
         
-        # Determine payment scope and amount
-        payment_scope = 'self'
-        paid_for_entry_id_to_save = None
-        
-        if pay == 'full' and partner_entry_id_int is not None and partner_entry is not None:
+        if tournament_type == 'team' and pay == 'full' and partner_entry_id_int is not None and partner_entry is not None:
             # Pair payment: 100% (full pair payment)
-            payment_amount = float(price_rub)
-            payment_scope = 'pair'
-            paid_for_entry_id_to_save = partner_entry_id_int
+            desired_scope = 'pair'
+            desired_paid_for_entry_id = partner_entry_id_int
+            desired_amount = float(price_rub)
         elif tournament_type == 'team':
-            if pay == 'full':
-                # Team tournament: 100% (full pair payment without partner specified - legacy)
-                payment_amount = float(price_rub)
-                payment_scope = 'pair'
-                # No partner specified, so paid_for_entry_id stays NULL
-            elif pay == 'half':
-                # Team tournament: 50% (single person payment)
-                payment_amount = float(price_rub) / 2
-                payment_scope = 'self'
-            else:
-                # Default for team: 50%
-                payment_amount = float(price_rub) / 2
-                payment_scope = 'self'
+            # Team tournament: 50% (single person payment)
+            desired_scope = 'self'
+            desired_paid_for_entry_id = None
+            desired_amount = float(price_rub) / 2
         else:
             # Personal tournament: always 100%
-            payment_amount = float(price_rub)
-            payment_scope = 'self'
+            desired_scope = 'self'
+            desired_paid_for_entry_id = None
+            desired_amount = float(price_rub)
+        
+        # Проверяем существующий payment_id
+        can_reuse_payment = False
+        if payment_id:
+            try:
+                print(f"PAYMENT CHECK: entry_id={entry_id}, payment_id={payment_id}")
+                payment = Payment.find_one(payment_id)
+                print(f"PAYMENT STATUS: {payment.status}")
+                
+                # Если платеж pending - проверяем соответствие желаемому контексту
+                if payment.status == 'pending' and payment.confirmation and payment.confirmation.confirmation_url:
+                    # Проверяем соответствие scope
+                    scope_match = (existing_payment_scope == desired_scope)
+                    
+                    # Если desired_scope == 'pair' - проверяем paid_for_entry_id
+                    paid_for_match = True
+                    if desired_scope == 'pair':
+                        paid_for_match = (existing_paid_for_entry_id == desired_paid_for_entry_id)
+                    
+                    can_reuse_payment = scope_match and paid_for_match
+                    
+                    print("PAY REUSE CHECK", {
+                        "entry_id": entry_id,
+                        "existing_payment_id": payment_id,
+                        "existing_status": payment.status,
+                        "existing_scope": existing_payment_scope,
+                        "existing_paid_for": existing_paid_for_entry_id,
+                        "desired_scope": desired_scope,
+                        "partner_entry_id": partner_entry_id_int,
+                        "desired_paid_for": desired_paid_for_entry_id,
+                        "amount": desired_amount,
+                        "reuse": can_reuse_payment
+                    })
+                    
+                    if can_reuse_payment:
+                        cur.close()
+                        conn.close()
+                        print(f"REDIRECT: using existing payment {payment_id}")
+                        return RedirectResponse(url=payment.confirmation.confirmation_url, status_code=302)
+                    else:
+                        # Не соответствует - очищаем старые поля и создадим новый
+                        print(f"PAYMENT MISMATCH: existing scope={existing_payment_scope}, desired scope={desired_scope}, clearing old payment")
+                        cur.execute("""
+                            UPDATE entries
+                            SET payment_id = NULL,
+                                payment_url = NULL,
+                                payment_status = 'pending',
+                                paid_for_entry_id = NULL,
+                                payment_scope = 'self'
+                            WHERE id = %s
+                        """, (entry_id,))
+                        conn.commit()
+                        payment_id = None
+                else:
+                    # Платеж не pending (succeeded/canceled/expired) - считаем невалидным
+                    print(f"PAYMENT INVALID: status={payment.status}, creating new")
+                    payment_id = None
+            except Exception as e:
+                # Платеж не найден или ошибка - считаем невалидным
+                print(f"PAYMENT ERROR: {str(e)}, creating new")
+                payment_id = None
+        
+        # Если платеж невалиден или payment_id пустой - создаем новый
+        print(f"CREATE NEW PAYMENT: entry_id={entry_id}, tournament_type={tournament_type}, pay={pay}, partner_entry_id={partner_entry_id_int}, desired_scope={desired_scope}")
+        
+        # Используем рассчитанные значения
+        payment_scope = desired_scope
+        paid_for_entry_id_to_save = desired_paid_for_entry_id
+        payment_amount = desired_amount
         
         print(f"PAYMENT SCOPE DETERMINED: payment_scope={payment_scope}, paid_for_entry_id={paid_for_entry_id_to_save}, payment_amount={payment_amount}")
         
