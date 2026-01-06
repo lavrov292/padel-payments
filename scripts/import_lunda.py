@@ -14,12 +14,15 @@ load_dotenv()
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import psycopg2
 from psycopg2.extras import execute_values
 from pathlib import Path
 import requests
 import sys
+
+# MSK timezone offset: UTC+3
+MSK_TZ = timezone(timedelta(hours=3))
 
 def get_db_conn():
     """Get database connection with SSL."""
@@ -37,6 +40,63 @@ def parse_price(price_str):
     if match:
         return int(match.group(1))
     return 0
+
+def normalize_msk(dt_str):
+    """
+    Normalize datetime string to MSK timezone (+03:00).
+    If timezone is missing, assumes MSK.
+    If timezone exists, converts to MSK.
+    Returns datetime object with tzinfo=+03:00.
+    """
+    if not dt_str:
+        return None
+    
+    # If already a datetime object
+    if isinstance(dt_str, datetime):
+        if dt_str.tzinfo is None:
+            # Naive datetime - assume it's MSK
+            return dt_str.replace(tzinfo=MSK_TZ)
+        else:
+            # Convert to MSK
+            return dt_str.astimezone(MSK_TZ)
+    
+    # Parse string
+    if isinstance(dt_str, str):
+        # Try parsing various formats
+        formats = [
+            "%Y-%m-%dT%H:%M:%S%z",  # ISO with timezone
+            "%Y-%m-%dT%H:%M:%S.%f%z",  # ISO with microseconds and timezone
+            "%Y-%m-%dT%H:%M:%S",  # ISO without timezone
+            "%Y-%m-%dT%H:%M:%S.%f",  # ISO with microseconds without timezone
+            "%Y-%m-%d %H:%M:%S",  # Space separator
+        ]
+        
+        dt = None
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(dt_str, fmt)
+                break
+            except ValueError:
+                continue
+        
+        if dt is None:
+            # Fallback: try parsing with dateutil or return None
+            try:
+                dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+            except:
+                print(f"WARNING: Could not parse datetime: {dt_str}")
+                return None
+        
+        # If timezone is missing, assume MSK
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MSK_TZ)
+        else:
+            # Convert to MSK
+            dt = dt.astimezone(MSK_TZ)
+        
+        return dt
+    
+    return None
 
 def check_column_exists(conn, table_name, column_name):
     """Check if column exists in table."""
@@ -57,8 +117,13 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
     tournament_info = tournament_data.get('tournament', {})
     
     location = tournament_info.get('location', '') or ''
-    starts_at = tournament_data.get('start_datetime')
-    ends_at = tournament_data.get('end_datetime')
+    starts_at_raw = tournament_data.get('start_datetime')
+    ends_at_raw = tournament_data.get('end_datetime')
+    
+    # Normalize datetime to MSK timezone
+    starts_at = normalize_msk(starts_at_raw)
+    ends_at = normalize_msk(ends_at_raw) if ends_at_raw else None
+    
     organizer = tournament_info.get('organizer', '')
     title = tournament_info.get('title', '')
     price_rub = parse_price(tournament_info.get('price', ''))
@@ -70,7 +135,7 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
         tournament_type = 'personal'  # Default to personal if not specified or invalid
     
     # Log tournament import
-    print(f"IMPORT TOURNAMENT: title={title}, location={location}, starts_at={starts_at}, type={tournament_type}")
+    print(f"IMPORT TOURNAMENT: title={title}, location={location}, starts_at={starts_at} (MSK), type={tournament_type}")
     
     # Check if new columns exist
     has_active = check_column_exists(conn, 'tournaments', 'active')
@@ -79,10 +144,11 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
     has_last_seen = check_column_exists(conn, 'tournaments', 'last_seen_in_source')
     has_source = check_column_exists(conn, 'tournaments', 'source')
     
-    # Check if tournament exists
+    # Check if tournament exists (compare as timestamptz)
+    # Note: PostgreSQL will compare timestamptz correctly even if timezone differs
     cur.execute("""
         SELECT id FROM tournaments 
-        WHERE location = %s AND starts_at = %s
+        WHERE location = %s AND starts_at = %s::timestamptz
     """, (location, starts_at))
     
     existing = cur.fetchone()
@@ -102,12 +168,13 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
         ]
         update_values = [ends_at, organizer, title, price_rub, source_last_updated, tournament_type]
         
-        if has_active:
-            update_fields.append("active = true")
-        if has_archived_at:
-            update_fields.append("archived_at = NULL")
+        # Always set last_seen_in_source = NOW() and archived_at = NULL when tournament is seen in JSON
         if has_last_seen:
             update_fields.append("last_seen_in_source = NOW()")
+        if has_archived_at:
+            update_fields.append("archived_at = NULL")
+        if has_active:
+            update_fields.append("active = true")
         if has_source:
             update_fields.append("source = 'lunda'")
         
@@ -127,15 +194,19 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
         insert_values = [location, starts_at, ends_at, organizer, title, price_rub, source_last_updated, tournament_type]
         insert_placeholders = ["%s"] * len(insert_fields)
         
-        if has_active:
-            insert_fields.append("active")
-            insert_values.append(True)
+        # Always set timestamps for new tournaments
         if has_first_seen:
             insert_fields.append("first_seen_in_source")
             insert_values.append("NOW()")
         if has_last_seen:
             insert_fields.append("last_seen_in_source")
             insert_values.append("NOW()")
+        if has_archived_at:
+            insert_fields.append("archived_at")
+            insert_values.append(None)  # Explicitly NULL for new tournaments
+        if has_active:
+            insert_fields.append("active")
+            insert_values.append(True)
         if has_source:
             insert_fields.append("source")
             insert_values.append("lunda")
@@ -146,6 +217,8 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
         for val in insert_values:
             if val == "NOW()":
                 placeholders.append("NOW()")
+            elif val is None:
+                placeholders.append("NULL")
             else:
                 placeholders.append("%s")
                 sql_values.append(val)
@@ -367,80 +440,73 @@ def update_sync_run(conn, sync_run_id, stats, error=None):
     conn.commit()
 
 def process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats):
-    """Process tournaments that are not in current JSON: archive (don't delete - preserve history)."""
+    """Archive tournaments that are not in current JSON (JSON is source of truth). Returns list of archived tournament IDs."""
     cur = conn.cursor()
     
-    # Check if new columns exist
-    has_source = check_column_exists(conn, 'tournaments', 'source')
+    # Check if required columns exist
     has_last_seen = check_column_exists(conn, 'tournaments', 'last_seen_in_source')
-    has_active = check_column_exists(conn, 'tournaments', 'active')
     has_archived_at = check_column_exists(conn, 'tournaments', 'archived_at')
-    has_entry_active = check_column_exists(conn, 'entries', 'active')
     
-    # If new columns don't exist, skip this functionality
-    if not has_source or not has_last_seen:
-        print("WARNING: New columns (source, last_seen_in_source) not found. Skipping missing tournaments processing.")
-        print("Please run migrations 002_add_tournament_source.sql and 002_tournament_archiving.sql first.")
-        return
+    # If columns don't exist, skip this functionality
+    if not has_last_seen or not has_archived_at:
+        print("WARNING: Required columns (last_seen_in_source, archived_at) not found.")
+        print("Please run migration 004_fix_tournament_archiving.sql first.")
+        return []
     
-    # Find tournaments from 'lunda' source that were not seen in this run
-    # Only process tournaments with source='lunda' AND active=true (don't touch manual tournaments or already archived)
+    # Find tournaments that were NOT seen in this run
+    # Archive tournaments where:
+    # - archived_at IS NULL (not already archived)
+    # - last_seen_in_source IS NULL OR last_seen_in_source < run_started_at (not seen in this run)
+    # - id NOT IN processed_tournament_ids (not in current JSON)
     if processed_tournament_ids:
         # Use NOT IN for list of IDs
         placeholders = ','.join(['%s'] * len(processed_tournament_ids))
         query = f"""
             SELECT t.id, t.title, t.location, t.starts_at
             FROM tournaments t
-            WHERE t.source = 'lunda'
-              AND t.active = true
-              AND (t.last_seen_in_source < %s OR t.last_seen_in_source IS NULL)
+            WHERE t.archived_at IS NULL
+              AND (t.last_seen_in_source IS NULL OR t.last_seen_in_source < %s)
               AND t.id NOT IN ({placeholders})
         """
         params = [run_started_at] + list(processed_tournament_ids)
     else:
-        # If no processed tournaments, check all that weren't seen
+        # If no processed tournaments, archive all that weren't seen
         query = """
             SELECT t.id, t.title, t.location, t.starts_at
             FROM tournaments t
-            WHERE t.source = 'lunda'
-              AND t.active = true
-              AND (t.last_seen_in_source < %s OR t.last_seen_in_source IS NULL)
+            WHERE t.archived_at IS NULL
+              AND (t.last_seen_in_source IS NULL OR t.last_seen_in_source < %s)
         """
         params = [run_started_at]
     
     cur.execute(query, params)
     missing_tournaments = cur.fetchall()
     
+    archived_ids = []
     for tournament_id, title, location, starts_at in missing_tournaments:
         # Archive tournament (don't delete - preserve history)
-        # Only archive tournaments with source='lunda' that are currently active
-        if has_active and has_archived_at:
-            cur.execute("""
-                UPDATE tournaments
-                SET active = false, archived_at = NOW()
-                WHERE id = %s AND source = 'lunda' AND active = true
-            """, (tournament_id,))
-        elif has_active:
-            cur.execute("""
-                UPDATE tournaments
-                SET active = false
-                WHERE id = %s AND source = 'lunda' AND active = true
-            """, (tournament_id,))
+        cur.execute("""
+            UPDATE tournaments
+            SET archived_at = NOW()
+            WHERE id = %s AND archived_at IS NULL
+        """, (tournament_id,))
         
         # Check if tournament was actually updated
         if cur.rowcount > 0:
-            # Also deactivate all entries for this tournament (both paid and pending)
-            if has_entry_active:
-                cur.execute("""
-                    UPDATE entries
-                    SET active = false
-                    WHERE tournament_id = %s
-                """, (tournament_id,))
-            
             stats['tournaments_archived'] += 1
+            archived_ids.append(tournament_id)
             print(f"ARCHIVED tournament: id={tournament_id}, title={title}, location={location}")
     
     conn.commit()
+    
+    # Log summary
+    if archived_ids:
+        print(f"\nARCHIVING SUMMARY: {len(archived_ids)} tournaments archived")
+        print(f"Example archived IDs: {archived_ids[:3]}")
+    else:
+        print("\nARCHIVING SUMMARY: No tournaments archived (all present in JSON)")
+    
+    return archived_ids
 
 def main():
     """Main import function."""
@@ -529,6 +595,7 @@ def main():
     
     # Track processed tournament IDs
     processed_tournament_ids = set()
+    archived_tournament_ids = []
     
     # Process each tournament
     error_occurred = None
@@ -543,13 +610,14 @@ def main():
         # Process tournaments that are missing from JSON
         if run_started_at:
             print("\nProcessing missing tournaments (not in JSON)...")
-            process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats)
+            archived_tournament_ids = process_missing_tournaments(conn, processed_tournament_ids, run_started_at, stats)
     except Exception as e:
         error_occurred = str(e)
         print(f"ERROR during processing: {error_occurred}")
         import traceback
         traceback.print_exc()
         conn.rollback()
+        archived_tournament_ids = []
     finally:
         # Update sync run with statistics
         if sync_run_id:
@@ -567,6 +635,10 @@ def main():
     print("="*50)
     print(f"Tournaments UPSERT: {stats['tournaments_upsert']}")
     print(f"Tournaments ARCHIVED: {stats['tournaments_archived']}")
+    if stats['tournaments_archived'] > 0:
+        print(f"  -> {stats['tournaments_archived']} tournaments were archived (not in current JSON)")
+        if archived_tournament_ids:
+            print(f"  -> Example archived tournament IDs: {archived_tournament_ids[:3]}")
     if stats['tournaments_deleted'] > 0:
         print(f"Tournaments DELETED: {stats['tournaments_deleted']}")
     print(f"Players UPSERT: {stats['players_upsert']}")

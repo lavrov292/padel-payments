@@ -37,10 +37,11 @@ export default function AdminPage() {
       setLoading(true);
       setErrorText(null);
 
-      // Load tournaments - query tournaments table directly to get both active and archived
+      // Load tournaments - only non-archived tournaments
       const { data: tournamentsData, error: tournamentsError } = await supabase
         .from("tournaments")
         .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source")
+        .is("archived_at", null)  // Only show non-archived tournaments
         .order("starts_at", { ascending: true });
       
       if (tournamentsError) {
