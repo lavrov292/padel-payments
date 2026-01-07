@@ -3104,6 +3104,274 @@ Username: {username_str}
                 traceback.print_exc()
                 await bot.answer_callback_query(callback_query["id"], text="Ошибка. Смотри логи.")
                 return {"ok": True}
+        
+        # bind_resolve_pending:<pending_id>:<player_id> - resolve pending by choosing existing player
+        if data.startswith("bind_resolve_pending:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                parts = data.split(":")
+                pending_id = int(parts[1])
+                player_id = int(parts[2])
+                
+                from_user = callback_query.get("from", {})
+                admin_telegram_id = str(from_user.get("id", "")) if from_user.get("id") else None
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get pending entry
+                cur.execute("""
+                    SELECT status, raw_player_name, normalized_name, payload, tournament_id
+                    FROM pending_entries
+                    WHERE id = %s
+                """, (pending_id,))
+                pending_row = cur.fetchone()
+                
+                if not pending_row:
+                    await bot.send_message(chat_id=chat_id, text="Запрос не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                pending_status, raw_player_name, normalized_name, payload_json, tournament_id = pending_row
+                
+                if pending_status != 'pending':
+                    await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Import normalize_name
+                import sys
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
+                if spec and spec.loader:
+                    import_lunda = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(import_lunda)
+                    normalize_name = import_lunda.normalize_name
+                else:
+                    def normalize_name(s):
+                        if not s:
+                            return ""
+                        import re
+                        s = s.strip().lower().replace('ё', 'е')
+                        s = re.sub(r'\s+', ' ', s)
+                        return s
+                
+                # Create alias
+                cur.execute("""
+                    INSERT INTO player_aliases (alias_name, normalized_alias, player_id, created_by_telegram_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (normalized_alias) 
+                    DO UPDATE SET player_id = EXCLUDED.player_id
+                """, (raw_player_name, normalize_name(raw_player_name), player_id, admin_telegram_id))
+                
+                # Get player name for response
+                cur.execute("SELECT full_name FROM players WHERE id = %s", (player_id,))
+                player_row = cur.fetchone()
+                player_full_name = player_row[0] if player_row else "Неизвестно"
+                
+                # Create entry if not exists
+                cur.execute("""
+                    SELECT id FROM entries
+                    WHERE tournament_id = %s AND player_id = %s
+                """, (tournament_id, player_id))
+                existing = cur.fetchone()
+                
+                if not existing:
+                    cur.execute("""
+                        INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+                        VALUES (%s, %s, 'pending', true, NOW(), NOW())
+                        RETURNING id
+                    """, (tournament_id, player_id))
+                    entry_id = cur.fetchone()[0]
+                else:
+                    entry_id = existing[0]
+                    cur.execute("""
+                        UPDATE entries
+                        SET active = true, last_seen_in_source = NOW()
+                        WHERE id = %s
+                    """, (entry_id,))
+                
+                # Update pending status
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET status = 'resolved',
+                        resolved_at = NOW(),
+                        resolved_player_id = %s
+                    WHERE id = %s
+                """, (player_id, pending_id))
+                
+                conn.commit()
+                cur.close()
+                conn.close()
+                
+                await bot.send_message(chat_id=chat_id, text=f"✅ Ок, привязал {raw_player_name} → {player_full_name}")
+                return {"ok": True}
+            except Exception as e:
+                print(f"BIND RESOLVE PENDING ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Смотри логи.")
+                return {"ok": True}
+        
+        # bind_resolve_pending_new:<pending_id> - resolve pending by creating new player
+        if data.startswith("bind_resolve_pending_new:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                pending_id = int(data.split(":")[1])
+                
+                from_user = callback_query.get("from", {})
+                admin_telegram_id = str(from_user.get("id", "")) if from_user.get("id") else None
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get pending entry
+                cur.execute("""
+                    SELECT status, raw_player_name, normalized_name, tournament_id
+                    FROM pending_entries
+                    WHERE id = %s
+                """, (pending_id,))
+                pending_row = cur.fetchone()
+                
+                if not pending_row:
+                    await bot.send_message(chat_id=chat_id, text="Запрос не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                pending_status, raw_player_name, normalized_name, tournament_id = pending_row
+                
+                if pending_status != 'pending':
+                    await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Import normalize_name
+                import sys
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
+                if spec and spec.loader:
+                    import_lunda = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(import_lunda)
+                    normalize_name = import_lunda.normalize_name
+                else:
+                    def normalize_name(s):
+                        if not s:
+                            return ""
+                        import re
+                        s = s.strip().lower().replace('ё', 'е')
+                        s = re.sub(r'\s+', ' ', s)
+                        return s
+                
+                # Create new player
+                cur.execute("""
+                    INSERT INTO players (full_name, normalized_name)
+                    VALUES (%s, %s)
+                    RETURNING id
+                """, (raw_player_name, normalized_name))
+                new_player_id = cur.fetchone()[0]
+                
+                # Create alias
+                cur.execute("""
+                    INSERT INTO player_aliases (alias_name, normalized_alias, player_id, created_by_telegram_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (normalized_alias) 
+                    DO UPDATE SET player_id = EXCLUDED.player_id
+                """, (raw_player_name, normalize_name(raw_player_name), new_player_id, admin_telegram_id))
+                
+                # Create entry
+                cur.execute("""
+                    INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+                    VALUES (%s, %s, 'pending', true, NOW(), NOW())
+                    RETURNING id
+                """, (tournament_id, new_player_id))
+                entry_id = cur.fetchone()[0]
+                
+                # Update pending status
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET status = 'resolved',
+                        resolved_at = NOW(),
+                        resolved_player_id = %s
+                    WHERE id = %s
+                """, (new_player_id, pending_id))
+                
+                conn.commit()
+                cur.close()
+                conn.close()
+                
+                await bot.send_message(chat_id=chat_id, text=f"✅ Создан новый игрок: {raw_player_name}. Участие добавлено.")
+                return {"ok": True}
+            except Exception as e:
+                print(f"BIND RESOLVE PENDING NEW ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Смотри логи.")
+                return {"ok": True}
+        
+        # bind_resolve_pending_skip:<pending_id> - snooze pending entry
+        if data.startswith("bind_resolve_pending_skip:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                pending_id = int(data.split(":")[1])
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Check status
+                cur.execute("SELECT status FROM pending_entries WHERE id = %s", (pending_id,))
+                row = cur.fetchone()
+                
+                if not row:
+                    await bot.send_message(chat_id=chat_id, text="Запрос не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                if row[0] != 'pending':
+                    await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Update status to snoozed
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET status = 'snoozed',
+                        notified_at = NOW()
+                    WHERE id = %s
+                """, (pending_id,))
+                
+                conn.commit()
+                cur.close()
+                conn.close()
+                
+                await bot.send_message(chat_id=chat_id, text="⏸ Отложено. Можно будет разрешить позже.")
+                return {"ok": True}
+            except Exception as e:
+                print(f"BIND RESOLVE PENDING SKIP ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Смотри логи.")
+                return {"ok": True}
 
     return {"ok": True}
 
@@ -3376,3 +3644,142 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
         "notified": notified,
         "details": details
     }
+
+@app.post("/admin/process-pending-players")
+async def process_pending_players(limit: int = Query(50, ge=1, le=200)):
+    """
+    Находит pending_entries со status='pending' и notified_at IS NULL,
+    отправляет админу Telegram уведомления с кнопками для разрешения.
+    """
+    print(f"PROCESS_PENDING_PLAYERS start, limit={limit}")
+    
+    if bot is None:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
+    
+    admin_telegram_id = os.getenv("ADMIN_TELEGRAM_ID")
+    if not admin_telegram_id:
+        return {"ok": False, "error": "ADMIN_TELEGRAM_ID not set"}
+    
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return {"ok": False, "error": "DATABASE_URL not set"}
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        # Get pending entries that haven't been notified
+        cur.execute("""
+            SELECT 
+                pe.id,
+                pe.tournament_id,
+                pe.raw_player_name,
+                pe.normalized_name,
+                pe.candidates,
+                t.title,
+                t.starts_at,
+                t.location
+            FROM pending_entries pe
+            JOIN tournaments t ON t.id = pe.tournament_id
+            WHERE pe.status = 'pending'
+              AND pe.notified_at IS NULL
+            ORDER BY pe.created_at ASC
+            LIMIT %s
+        """, (limit,))
+        
+        rows = cur.fetchall()
+        notified_count = 0
+        
+        for row in rows:
+            pending_id, tournament_id, raw_name, normalized_name, candidates_json, tournament_title, starts_at, location = row
+            
+            try:
+                # Parse candidates
+                candidates = json.loads(candidates_json) if candidates_json else []
+                
+                # Format starts_at
+                if starts_at:
+                    if isinstance(starts_at, datetime):
+                        if starts_at.tzinfo is None:
+                            starts_at_utc = starts_at.replace(tzinfo=timezone.utc)
+                        else:
+                            starts_at_utc = starts_at.astimezone(timezone.utc)
+                        starts_at_msk = starts_at_utc.astimezone(BOT_TZ)
+                        starts_at_str = starts_at_msk.strftime("%d.%m.%Y %H:%M")
+                    else:
+                        starts_at_str = str(starts_at)
+                else:
+                    starts_at_str = "Не указано"
+                
+                location_str = location or "Не указано"
+                
+                # Build message
+                message = f"""⚠️ Спорное имя: {raw_name}
+Турнир: {tournament_title} ({starts_at_str})
+Место: {location_str}
+
+Выбери правильного игрока:"""
+                
+                # Build buttons (max 8 candidates)
+                buttons = []
+                for cand in candidates[:8]:
+                    player_name = cand.get('name', 'Неизвестно')
+                    player_id = cand.get('player_id')
+                    if player_id:
+                        buttons.append([InlineKeyboardButton(
+                            player_name,
+                            callback_data=f"bind_resolve_pending:{pending_id}:{player_id}"
+                        )])
+                
+                # Add action buttons
+                buttons.append([InlineKeyboardButton(
+                    "➕ Это новый игрок",
+                    callback_data=f"bind_resolve_pending_new:{pending_id}"
+                )])
+                buttons.append([InlineKeyboardButton(
+                    "⏸ Отложить",
+                    callback_data=f"bind_resolve_pending_skip:{pending_id}"
+                )])
+                
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                # Send message to admin
+                result = await bot.send_message(
+                    chat_id=admin_telegram_id,
+                    text=message,
+                    reply_markup=keyboard
+                )
+                
+                # Update notified_at
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET notified_at = NOW()
+                    WHERE id = %s
+                """, (pending_id,))
+                conn.commit()
+                
+                notified_count += 1
+                print(f"PENDING NOTIFIED: pending_id={pending_id}, raw_name={raw_name}, candidates={len(candidates)}")
+                
+            except Exception as e:
+                print(f"ERROR notifying pending {pending_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        cur.close()
+        conn.close()
+        
+        print(f"PROCESS_PENDING_PLAYERS: found={len(rows)}, notified={notified_count}")
+        
+        return {
+            "ok": True,
+            "found": len(rows),
+            "notified": notified_count
+        }
+        
+    except Exception as e:
+        print(f"PROCESS_PENDING_PLAYERS ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}

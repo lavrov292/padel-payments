@@ -1323,6 +1323,30 @@ def main():
     
     print("="*50)
     
+    # Auto-trigger pending players processing
+    print("\n" + "="*50)
+    print("AUTO-TRIGGERING PENDING PLAYERS PROCESSING")
+    print("="*50)
+    
+    backend_base_url = os.getenv("BACKEND_BASE_URL", "https://padel-payments.onrender.com")
+    pending_limit = 50
+    
+    try:
+        endpoint_url = f"{backend_base_url}/admin/process-pending-players?limit={pending_limit}"
+        response = requests.post(endpoint_url, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            found = result.get('found', 0)
+            notified = result.get('notified', 0)
+            print(f"AUTO PENDING: status={response.status_code}, found={found}, notified={notified}")
+        else:
+            print(f"AUTO PENDING: status={response.status_code}, error={response.text}")
+    except Exception as e:
+        print(f"AUTO PENDING ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+    
     # Always return 0 (success) for launchd - errors are logged but don't fail the import
     return 0
 
