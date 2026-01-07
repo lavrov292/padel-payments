@@ -327,31 +327,46 @@ def resolve_player(conn, raw_name):
         return (row[0], None)  # Exact match
     
     # 3. Find candidates by Levenshtein
-    cur.execute("""
-        SELECT id, full_name, 
-               levenshtein(normalized_name, %s) AS dist
-        FROM players
-        WHERE normalized_name IS NOT NULL
-        ORDER BY dist ASC
-        LIMIT 6
-    """, (norm,))
-    rows = cur.fetchall()
-    cur.close()
-    
+    threshold = get_levenshtein_threshold(norm_len)
     candidates = []
     best_dist = None
-    for player_id, name, dist in rows:
-        candidates.append({
-            'player_id': player_id,
-            'name': name,
-            'dist': dist
-        })
-        if best_dist is None:
-            best_dist = dist
+    
+    try:
+        cur.execute("""
+            SELECT id, full_name, 
+                   levenshtein(normalized_name, %s::text) AS dist
+            FROM players
+            WHERE normalized_name IS NOT NULL
+            ORDER BY dist ASC
+            LIMIT 6
+        """, (norm,))
+        rows = cur.fetchall()
+        
+        for player_id, name, dist in rows:
+            candidates.append({
+                'player_id': player_id,
+                'name': name,
+                'dist': dist
+            })
+            if best_dist is None:
+                best_dist = dist
+        
+        print(f"FUZZY MATCH: input=\"{raw_name}\", candidates={len(candidates)}, threshold={threshold}")
+    except psycopg2.Error as e:
+        error_msg = str(e).lower()
+        if 'levenshtein' in error_msg or 'fuzzystrmatch' in error_msg or 'does not exist' in error_msg:
+            print(f"LEVENSHTEIN DISABLED: {e}")
+            print(f"FUZZY MATCH FALLBACK: disabled")
+            candidates = []
+            best_dist = None
+        else:
+            # Re-raise if it's a different error
+            raise
+    
+    cur.close()
     
     # 4. Check threshold
     if candidates and best_dist is not None:
-        threshold = get_levenshtein_threshold(norm_len)
         if best_dist <= threshold:
             return (None, candidates)  # Ambiguous - needs admin decision
     
@@ -362,26 +377,39 @@ def find_candidate_players(conn, normalized_name, limit=6):
     """
     Find candidate players by Levenshtein distance.
     Returns list of {player_id, name, dist}.
+    Falls back to empty list if Levenshtein extension is not available.
     """
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, full_name, 
-               levenshtein(normalized_name, %s) AS dist
-        FROM players
-        WHERE normalized_name IS NOT NULL
-        ORDER BY dist ASC
-        LIMIT %s
-    """, (normalized_name, limit))
-    rows = cur.fetchall()
-    cur.close()
-    
     candidates = []
-    for player_id, name, dist in rows:
-        candidates.append({
-            'player_id': player_id,
-            'name': name,
-            'dist': dist
-        })
+    
+    try:
+        cur.execute("""
+            SELECT id, full_name, 
+                   levenshtein(normalized_name, %s::text) AS dist
+            FROM players
+            WHERE normalized_name IS NOT NULL
+            ORDER BY dist ASC
+            LIMIT %s
+        """, (normalized_name, limit))
+        rows = cur.fetchall()
+        
+        for player_id, name, dist in rows:
+            candidates.append({
+                'player_id': player_id,
+                'name': name,
+                'dist': dist
+            })
+    except psycopg2.Error as e:
+        error_msg = str(e).lower()
+        if 'levenshtein' in error_msg or 'fuzzystrmatch' in error_msg or 'does not exist' in error_msg:
+            print(f"LEVENSHTEIN DISABLED: {e}")
+            print(f"FUZZY MATCH FALLBACK: disabled")
+            candidates = []
+        else:
+            # Re-raise if it's a different error
+            raise
+    
+    cur.close()
     return candidates
 
 def upsert_player(conn, full_name):

@@ -91,3 +91,4 @@ JOIN tournaments t ON e.tournament_id = t.id
 WHERE t.archived_at IS NULL;
 
 
+
