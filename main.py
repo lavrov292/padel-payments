@@ -2836,6 +2836,274 @@ Username: {username_str}
                 await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
             return {"ok": True}
         
+        # pending_approve:<pending_id>:<player_id> - approve pending entry
+        if data.startswith("pending_approve:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                parts = data.split(":")
+                pending_id = int(parts[1])
+                player_id = int(parts[2])
+                
+                from_user = callback_query.get("from", {})
+                admin_telegram_id = str(from_user.get("id", "")) if from_user.get("id") else None
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get pending entry
+                cur.execute("""
+                    SELECT status, raw_player_name, normalized_name, payload
+                    FROM pending_entries
+                    WHERE id = %s
+                """, (pending_id,))
+                pending_row = cur.fetchone()
+                
+                if not pending_row:
+                    await bot.send_message(chat_id=chat_id, text="Запрос не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                pending_status, raw_player_name, normalized_name, payload_json = pending_row
+                
+                if pending_status != 'pending':
+                    if pending_status == 'expired':
+                        await bot.answer_callback_query(callback_query["id"], text="Запрос устарел")
+                    else:
+                        await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Import normalize_name
+                import sys
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
+                if spec and spec.loader:
+                    import_lunda = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(import_lunda)
+                    normalize_name = import_lunda.normalize_name
+                else:
+                    def normalize_name(s):
+                        if not s:
+                            return ""
+                        import re
+                        s = s.strip().lower().replace('ё', 'е')
+                        s = re.sub(r'\s+', ' ', s)
+                        return s
+                
+                # Create alias
+                cur.execute("""
+                    INSERT INTO player_aliases (alias_name, normalized_alias, player_id, created_by_telegram_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (normalized_alias) 
+                    DO UPDATE SET player_id = EXCLUDED.player_id
+                """, (raw_player_name, normalize_name(raw_player_name), player_id, admin_telegram_id))
+                
+                # Create entry from payload
+                payload = json.loads(payload_json)
+                tournament_id = payload['tournament_id']
+                
+                # Use upsert_entry logic (simplified)
+                cur.execute("""
+                    SELECT id FROM entries
+                    WHERE tournament_id = %s AND player_id = %s
+                """, (tournament_id, player_id))
+                existing = cur.fetchone()
+                
+                if not existing:
+                    # Create new entry
+                    cur.execute("""
+                        INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+                        VALUES (%s, %s, 'pending', true, NOW(), NOW())
+                        RETURNING id
+                    """, (tournament_id, player_id))
+                    entry_id = cur.fetchone()[0]
+                else:
+                    entry_id = existing[0]
+                    # Update existing
+                    cur.execute("""
+                        UPDATE entries
+                        SET active = true, last_seen_in_source = NOW()
+                        WHERE id = %s
+                    """, (entry_id,))
+                
+                # Update pending status
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET status = 'approved'
+                    WHERE id = %s
+                """, (pending_id,))
+                
+                conn.commit()
+                cur.close()
+                conn.close()
+                
+                await bot.send_message(chat_id=chat_id, text="✅ Привязал. Участие добавлено.")
+                return {"ok": True}
+            except Exception as e:
+                print(f"PENDING APPROVE ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Попробуй ещё раз или нажми Отмена.")
+            return {"ok": True}
+        
+        # pending_new_player:<pending_id> - create new player from pending entry
+        if data.startswith("pending_new_player:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                pending_id = int(data.split(":")[1])
+                
+                from_user = callback_query.get("from", {})
+                admin_telegram_id = str(from_user.get("id", "")) if from_user.get("id") else None
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Get pending entry
+                cur.execute("""
+                    SELECT status, raw_player_name, normalized_name, payload
+                    FROM pending_entries
+                    WHERE id = %s
+                """, (pending_id,))
+                pending_row = cur.fetchone()
+                
+                if not pending_row:
+                    await bot.send_message(chat_id=chat_id, text="Запрос не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                pending_status, raw_player_name, normalized_name, payload_json = pending_row
+                
+                if pending_status != 'pending':
+                    if pending_status == 'expired':
+                        await bot.answer_callback_query(callback_query["id"], text="Запрос устарел")
+                    else:
+                        await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Import normalize_name
+                import sys
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
+                if spec and spec.loader:
+                    import_lunda = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(import_lunda)
+                    normalize_name = import_lunda.normalize_name
+                else:
+                    def normalize_name(s):
+                        if not s:
+                            return ""
+                        import re
+                        s = s.strip().lower().replace('ё', 'е')
+                        s = re.sub(r'\s+', ' ', s)
+                        return s
+                
+                # Create new player
+                cur.execute("""
+                    INSERT INTO players (full_name, normalized_name)
+                    VALUES (%s, %s)
+                    RETURNING id
+                """, (raw_player_name, normalized_name))
+                new_player_id = cur.fetchone()[0]
+                
+                # Create entry from payload
+                payload = json.loads(payload_json)
+                tournament_id = payload['tournament_id']
+                
+                cur.execute("""
+                    INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+                    VALUES (%s, %s, 'pending', true, NOW(), NOW())
+                    RETURNING id
+                """, (tournament_id, new_player_id))
+                entry_id = cur.fetchone()[0]
+                
+                # Update pending status and save created_player_id
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET status = 'approved',
+                        payload = jsonb_set(payload, '{created_player_id}', %s::text::jsonb)
+                    WHERE id = %s
+                """, (json.dumps(new_player_id), pending_id))
+                
+                conn.commit()
+                cur.close()
+                conn.close()
+                
+                await bot.send_message(chat_id=chat_id, text=f"✅ Создан новый игрок: {raw_player_name}. Участие добавлено.")
+                return {"ok": True}
+            except Exception as e:
+                print(f"PENDING NEW PLAYER ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Смотри логи.")
+                return {"ok": True}
+        
+        # pending_reject:<pending_id> - reject pending entry
+        if data.startswith("pending_reject:"):
+            try:
+                await bot.answer_callback_query(callback_query["id"])
+                pending_id = int(data.split(":")[1])
+                
+                database_url = os.getenv("DATABASE_URL")
+                if not database_url:
+                    await bot.send_message(chat_id=chat_id, text="Ошибка: база данных не настроена.")
+                    return {"ok": True}
+                
+                conn = psycopg2.connect(database_url, sslmode="require")
+                cur = conn.cursor()
+                
+                # Check status
+                cur.execute("SELECT status FROM pending_entries WHERE id = %s", (pending_id,))
+                row = cur.fetchone()
+                
+                if not row:
+                    await bot.send_message(chat_id=chat_id, text="Запрос не найден.")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                if row[0] != 'pending':
+                    if row[0] == 'expired':
+                        await bot.answer_callback_query(callback_query["id"], text="Запрос устарел")
+                    else:
+                        await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
+                    cur.close()
+                    conn.close()
+                    return {"ok": True}
+                
+                # Update status
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET status = 'rejected'
+                    WHERE id = %s
+                """, (pending_id,))
+                
+                conn.commit()
+                cur.close()
+                conn.close()
+                
+                await bot.send_message(chat_id=chat_id, text="Ок, пропустил.")
+                return {"ok": True}
+            except Exception as e:
+                print(f"PENDING REJECT ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                await bot.answer_callback_query(callback_query["id"], text="Ошибка. Смотри логи.")
+                return {"ok": True}
 
     return {"ok": True}
 

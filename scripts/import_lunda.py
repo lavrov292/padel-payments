@@ -20,9 +20,28 @@ from psycopg2.extras import execute_values
 from pathlib import Path
 import requests
 import sys
+import re
 
 # MSK timezone offset: UTC+3
 MSK_TZ = timezone(timedelta(hours=3))
+
+def normalize_name(s):
+    """
+    Normalize name for comparison/searching.
+    - strip and lowercase
+    - replace 'ё' with 'е'
+    - collapse whitespace
+    Returns normalized string (NEVER show to users).
+    """
+    if not s:
+        return ""
+    # Strip and lowercase
+    s = s.strip().lower()
+    # Replace ё with е
+    s = s.replace('ё', 'е')
+    # Collapse whitespace
+    s = re.sub(r'\s+', ' ', s)
+    return s
 
 def get_db_conn():
     """Get database connection with SSL."""
@@ -251,16 +270,153 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
         conn.commit()
         return (tournament_id, True)
 
-def upsert_player(conn, full_name):
-    """UPSERT player by full_name. Returns player_id."""
+def get_levenshtein_threshold(normalized_name_len):
+    """
+    Get dynamic threshold for Levenshtein distance based on name length.
+    - len <= 12 -> 1
+    - 13..20 -> 2
+    - > 20 -> 3
+    """
+    if normalized_name_len <= 12:
+        return 1
+    elif normalized_name_len <= 20:
+        return 2
+    else:
+        return 3
+
+def resolve_player(conn, raw_name):
+    """
+    Resolve player by name using hybrid logic:
+    1. Try alias
+    2. Try exact normalized match
+    3. Find candidates by Levenshtein
+    4. Check threshold
+    
+    Returns:
+    - (player_id, None) if exact match found
+    - (None, candidates) if ambiguous (best_dist <= threshold)
+    - (None, []) if new player (no candidates or best_dist > threshold)
+    """
+    if not raw_name:
+        return (None, [])
+    
+    norm = normalize_name(raw_name)
+    norm_len = len(norm)
     cur = conn.cursor()
     
+    # 1. Try alias first
     cur.execute("""
-        INSERT INTO players (full_name)
-        VALUES (%s)
-        ON CONFLICT (full_name) DO NOTHING
-        RETURNING id
-    """, (full_name,))
+        SELECT player_id FROM player_aliases 
+        WHERE normalized_alias = %s
+        LIMIT 1
+    """, (norm,))
+    row = cur.fetchone()
+    if row:
+        cur.close()
+        return (row[0], None)  # Exact match via alias
+    
+    # 2. Try exact normalized match
+    cur.execute("""
+        SELECT id FROM players 
+        WHERE normalized_name = %s
+        LIMIT 1
+    """, (norm,))
+    row = cur.fetchone()
+    if row:
+        cur.close()
+        return (row[0], None)  # Exact match
+    
+    # 3. Find candidates by Levenshtein
+    cur.execute("""
+        SELECT id, full_name, 
+               levenshtein(normalized_name, %s) AS dist
+        FROM players
+        WHERE normalized_name IS NOT NULL
+        ORDER BY dist ASC
+        LIMIT 6
+    """, (norm,))
+    rows = cur.fetchall()
+    cur.close()
+    
+    candidates = []
+    best_dist = None
+    for player_id, name, dist in rows:
+        candidates.append({
+            'player_id': player_id,
+            'name': name,
+            'dist': dist
+        })
+        if best_dist is None:
+            best_dist = dist
+    
+    # 4. Check threshold
+    if candidates and best_dist is not None:
+        threshold = get_levenshtein_threshold(norm_len)
+        if best_dist <= threshold:
+            return (None, candidates)  # Ambiguous - needs admin decision
+    
+    # 5. New player (no candidates or best_dist > threshold)
+    return (None, [])
+
+def find_candidate_players(conn, normalized_name, limit=6):
+    """
+    Find candidate players by Levenshtein distance.
+    Returns list of {player_id, name, dist}.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, full_name, 
+               levenshtein(normalized_name, %s) AS dist
+        FROM players
+        WHERE normalized_name IS NOT NULL
+        ORDER BY dist ASC
+        LIMIT %s
+    """, (normalized_name, limit))
+    rows = cur.fetchall()
+    cur.close()
+    
+    candidates = []
+    for player_id, name, dist in rows:
+        candidates.append({
+            'player_id': player_id,
+            'name': name,
+            'dist': dist
+        })
+    return candidates
+
+def upsert_player(conn, full_name):
+    """
+    UPSERT player by full_name.
+    Also updates normalized_name if missing.
+    Returns player_id.
+    """
+    cur = conn.cursor()
+    
+    # Check if normalized_name column exists
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'players' AND column_name = 'normalized_name'
+    """)
+    has_normalized = cur.fetchone() is not None
+    
+    norm = normalize_name(full_name) if has_normalized else None
+    
+    # Insert or get existing
+    if has_normalized:
+        cur.execute("""
+            INSERT INTO players (full_name, normalized_name)
+            VALUES (%s, %s)
+            ON CONFLICT (full_name) DO UPDATE 
+            SET normalized_name = COALESCE(players.normalized_name, EXCLUDED.normalized_name)
+            RETURNING id
+        """, (full_name, norm))
+    else:
+        cur.execute("""
+            INSERT INTO players (full_name)
+            VALUES (%s)
+            ON CONFLICT (full_name) DO NOTHING
+            RETURNING id
+        """, (full_name,))
     
     row = cur.fetchone()
     if row:
@@ -269,8 +425,16 @@ def upsert_player(conn, full_name):
         # Player already exists, get its id
         cur.execute("SELECT id FROM players WHERE full_name = %s", (full_name,))
         player_id = cur.fetchone()[0]
+        # Update normalized_name if missing
+        if has_normalized and norm:
+            cur.execute("""
+                UPDATE players 
+                SET normalized_name = %s 
+                WHERE id = %s AND normalized_name IS NULL
+            """, (norm, player_id))
     
     conn.commit()
+    cur.close()
     return player_id
 
 def upsert_entry(conn, tournament_id, player_id):
@@ -339,7 +503,163 @@ def upsert_entry(conn, tournament_id, player_id):
         conn.commit()
         return (entry_id, True)
 
-def process_tournament(conn, tournament_data, stats, global_last_updated=None, processed_tournament_ids=None):
+def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, normalized_name, payload, candidates):
+    """
+    Create or update pending_entry.
+    Returns pending_entry_id.
+    """
+    cur = conn.cursor()
+    import json
+    
+    # Try to find existing pending entry
+    cur.execute("""
+        SELECT id FROM pending_entries
+        WHERE sync_run_id = %s 
+          AND tournament_id = %s 
+          AND normalized_name = %s
+          AND raw_player_name = %s
+        LIMIT 1
+    """, (sync_run_id, tournament_id, normalized_name, raw_player_name))
+    
+    row = cur.fetchone()
+    if row:
+        # Update existing
+        pending_id = row[0]
+        cur.execute("""
+            UPDATE pending_entries
+            SET candidates = %s, status = 'pending', created_at = NOW()
+            WHERE id = %s
+        """, (json.dumps(candidates), pending_id))
+    else:
+        # Create new
+        cur.execute("""
+            INSERT INTO pending_entries 
+            (sync_run_id, tournament_id, raw_player_name, normalized_name, payload, candidates, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+            RETURNING id
+        """, (
+            sync_run_id,
+            tournament_id,
+            raw_player_name,
+            normalized_name,
+            json.dumps(payload),
+            json.dumps(candidates)
+        ))
+        row = cur.fetchone()
+        pending_id = row[0] if row else None
+    
+    conn.commit()
+    cur.close()
+    return pending_id
+
+def send_pending_notification_to_admin(bot_token, admin_chat_id, pending_id, tournament_title, starts_at, raw_player_name, candidates):
+    """
+    Send Telegram notification to admin about pending entry.
+    Returns message_id or None.
+    """
+    if not bot_token or not admin_chat_id:
+        return None
+    
+    try:
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+        
+        bot = Bot(token=bot_token)
+        
+        # Format starts_at
+        if starts_at:
+            if isinstance(starts_at, datetime):
+                starts_at_str = starts_at.strftime("%d.%m.%Y %H:%M")
+            else:
+                starts_at_str = str(starts_at)
+        else:
+            starts_at_str = "Не указано"
+        
+        # Build message
+        message = f"""⚠️ Имя из Lunda не совпало с базой.
+
+Турнир: {tournament_title} ({starts_at_str})
+Имя из Lunda: {raw_player_name}
+
+Выбери кто это:"""
+        
+        # Build buttons
+        buttons = []
+        for cand in candidates[:6]:  # Max 6 candidates
+            name = cand['name']
+            dist = cand['dist']
+            player_id = cand['player_id']
+            button_text = f"{name} (dist={dist})"
+            buttons.append([InlineKeyboardButton(
+                button_text,
+                callback_data=f"pending_approve:{pending_id}:{player_id}"
+            )])
+        
+        buttons.append([InlineKeyboardButton(
+            "➕ Это новый игрок",
+            callback_data=f"pending_new_player:{pending_id}"
+        )])
+        buttons.append([InlineKeyboardButton(
+            "❌ Игнор",
+            callback_data=f"pending_reject:{pending_id}"
+        )])
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        
+        # Send message using async
+        try:
+            import asyncio
+            # Create new event loop if needed
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            if loop.is_running():
+                # If loop is already running, we can't use asyncio.run
+                # Use a thread instead
+                import threading
+                result_container = {'result': None, 'error': None}
+                
+                def send_in_thread():
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        result = new_loop.run_until_complete(bot.send_message(
+                            chat_id=admin_chat_id,
+                            text=message,
+                            reply_markup=keyboard
+                        ))
+                        result_container['result'] = result
+                        new_loop.close()
+                    except Exception as e:
+                        result_container['error'] = e
+                
+                thread = threading.Thread(target=send_in_thread)
+                thread.start()
+                thread.join(timeout=10)
+                
+                if result_container['error']:
+                    raise result_container['error']
+                result = result_container['result']
+            else:
+                result = loop.run_until_complete(bot.send_message(
+                    chat_id=admin_chat_id,
+                    text=message,
+                    reply_markup=keyboard
+                ))
+            
+            return result.message_id if result else None
+        except Exception as e:
+            print(f"ERROR sending pending notification: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    except Exception as e:
+        print(f"ERROR sending pending notification: {e}")
+        return None
+
+def process_tournament(conn, tournament_data, stats, global_last_updated=None, processed_tournament_ids=None, sync_run_id=None):
     """Process single tournament: upsert tournament, participants, and handle removed entries."""
     # 1. UPSERT tournament
     tournament_info = tournament_data.get('tournament', {})
@@ -364,19 +684,112 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
     
     # 4. Process participants
     processed_player_ids = set()
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+    
+    # Get tournament info for pending notifications
+    cur.execute("SELECT title, starts_at FROM tournaments WHERE id = %s", (tournament_id,))
+    tour_row = cur.fetchone()
+    tournament_title = tour_row[0] if tour_row else "Неизвестный турнир"
+    tournament_starts_at = tour_row[1] if tour_row else None
+    
     for participant_name in participant_names:
-        # UPSERT player
-        player_id = upsert_player(conn, participant_name)
-        if player_id not in processed_player_ids:
-            stats['players_upsert'] += 1
-            processed_player_ids.add(player_id)
+        if not participant_name:
+            continue
         
-        # UPSERT entry
-        entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
-        if was_new:
-            stats['entries_new'] += 1
+        # Resolve player using hybrid logic
+        player_id, candidates = resolve_player(conn, participant_name)
+        
+        if player_id:
+            # Exact match found - create/update entry
+            if player_id not in processed_player_ids:
+                stats['players_upsert'] += 1
+                processed_player_ids.add(player_id)
+            
+            entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
+            if was_new:
+                stats['entries_new'] += 1
+            else:
+                stats['entries_existing'] += 1
+        elif candidates:
+            # Ambiguous case - best_dist <= threshold
+            # Create pending entry for admin decision
+            norm = normalize_name(participant_name)
+            payload = {
+                'tournament_id': tournament_id,
+                'raw_player_name': participant_name,
+                'normalized_name': norm
+            }
+            
+            pending_id = create_pending_entry(
+                conn, sync_run_id, tournament_id, 
+                participant_name, norm, payload, candidates
+            )
+            
+            if pending_id:
+                # Send notification to admin
+                message_id = send_pending_notification_to_admin(
+                    bot_token, admin_chat_id, pending_id,
+                    tournament_title, tournament_starts_at,
+                    participant_name, candidates
+                )
+                
+                # Update admin_message_id
+                if message_id:
+                    cur.execute("""
+                        UPDATE pending_entries 
+                        SET admin_message_id = %s 
+                        WHERE id = %s
+                    """, (message_id, pending_id))
+                    conn.commit()
+                
+                print(f"PENDING: {participant_name} -> {len(candidates)} candidates, pending_id={pending_id}")
         else:
-            stats['entries_existing'] += 1
+            # New player - create player and entry
+            norm = normalize_name(participant_name)
+            player_id = upsert_player(conn, participant_name)
+            
+            if player_id not in processed_player_ids:
+                stats['players_upsert'] += 1
+                processed_player_ids.add(player_id)
+            
+            entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
+            if was_new:
+                stats['entries_new'] += 1
+            else:
+                stats['entries_existing'] += 1
+            
+            # Optional: send info to admin about new player
+            if bot_token and admin_chat_id:
+                try:
+                    import asyncio
+                    from telegram import Bot
+                    bot = Bot(token=bot_token)
+                    info_msg = f"ℹ️ Добавлен новый игрок: {participant_name}"
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            import threading
+                            def send_info():
+                                new_loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(new_loop)
+                                new_loop.run_until_complete(bot.send_message(
+                                    chat_id=admin_chat_id,
+                                    text=info_msg
+                                ))
+                                new_loop.close()
+                            thread = threading.Thread(target=send_info)
+                            thread.start()
+                            thread.join(timeout=5)
+                        else:
+                            loop.run_until_complete(bot.send_message(
+                                chat_id=admin_chat_id,
+                                text=info_msg
+                            ))
+                    except Exception as e:
+                        print(f"INFO: Failed to send new player notification: {e}")
+                except Exception as e:
+                    pass  # Ignore errors in optional notification
     
     # 5. Handle entries that are no longer in participants
     # Get player_ids for new participants
@@ -716,7 +1129,7 @@ def main():
         # Ensure connection is alive before processing
         try:
             conn = ensure_conn(conn)
-            process_tournament(conn, tournament_data, stats, global_last_updated, processed_tournament_ids)
+            process_tournament(conn, tournament_data, stats, global_last_updated, processed_tournament_ids, sync_run_id)
             conn.commit()
         except Exception as e:
             # Tournament error - log and continue
@@ -760,6 +1173,24 @@ def main():
             for err in tournament_errors:
                 print(f"  - {err}")
     # Update sync run with statistics
+    # Expire old pending entries
+    if sync_run_id:
+        try:
+            conn = ensure_conn(conn)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE pending_entries 
+                SET status = 'expired'
+                WHERE status = 'pending' AND sync_run_id <> %s
+            """, (sync_run_id,))
+            expired_count = cur.rowcount
+            conn.commit()
+            cur.close()
+            if expired_count > 0:
+                print(f"Expired {expired_count} old pending entries")
+        except Exception as e:
+            print(f"WARNING: Failed to expire old pending entries: {e}")
+    
     if sync_run_id:
         try:
             conn = ensure_conn(conn)

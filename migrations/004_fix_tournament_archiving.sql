@@ -96,3 +96,4 @@ JOIN players p ON e.player_id = p.id
 JOIN tournaments t ON e.tournament_id = t.id
 WHERE t.archived_at IS NULL;  -- Only show entries for non-archived tournaments
 
+
