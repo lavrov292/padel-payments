@@ -95,6 +95,41 @@ def fmt_date_ru(date_input) -> tuple[str, str]:
         except:
             return (str(date_input), str(date_input))
 
+def parse_json_maybe(value):
+    """
+    Safely parse JSON value that can be:
+    - Already parsed (list/dict) -> return as-is
+    - JSON string -> parse and return
+    - None/empty -> return []
+    
+    Returns: parsed value or [] on error
+    """
+    if value is None:
+        return []
+    
+    if isinstance(value, (list, dict)):
+        # Already parsed
+        return value
+    
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"PARSE_JSON_MAYBE ERROR: failed to parse JSON string: {e}, value={value[:100] if len(str(value)) > 100 else value}")
+            return []
+    
+    # For other types, try to convert to string and parse
+    try:
+        value_str = str(value)
+        if not value_str.strip():
+            return []
+        return json.loads(value_str)
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"PARSE_JSON_MAYBE ERROR: failed to parse value: {e}, type={type(value)}")
+        return []
+
 def set_support_mode(telegram_id, enabled):
     """Set support_mode for telegram_id."""
     conn = get_db_conn()
@@ -3694,8 +3729,8 @@ async def process_pending_players(limit: int = Query(50, ge=1, le=200)):
             pending_id, tournament_id, raw_name, normalized_name, candidates_json, tournament_title, starts_at, location = row
             
             try:
-                # Parse candidates
-                candidates = json.loads(candidates_json) if candidates_json else []
+                # Parse candidates (can be already parsed from JSONB or string)
+                candidates = parse_json_maybe(candidates_json)
                 
                 # Format starts_at
                 if starts_at:
