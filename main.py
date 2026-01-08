@@ -3198,42 +3198,110 @@ Username: {username_str}
                         s = re.sub(r'\s+', ' ', s)
                         return s
                 
-                # Create alias
+                # 1. Create/update alias (UNIQUE by normalized_alias)
+                alias_normalized = normalize_name(raw_player_name)
                 cur.execute("""
                     INSERT INTO player_aliases (alias_name, normalized_alias, player_id, created_by_telegram_id)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (normalized_alias) 
-                    DO UPDATE SET player_id = EXCLUDED.player_id
-                """, (raw_player_name, normalize_name(raw_player_name), player_id, admin_telegram_id))
+                    DO UPDATE SET 
+                        player_id = EXCLUDED.player_id,
+                        alias_name = EXCLUDED.alias_name,
+                        created_by_telegram_id = EXCLUDED.created_by_telegram_id
+                """, (raw_player_name, alias_normalized, player_id, admin_telegram_id))
+                print(f"RESOLVED: Alias created/updated: '{raw_player_name}' (normalized: '{alias_normalized}') -> player_id={player_id}")
+                
+                # Find and merge duplicate players: find players with the same normalized_name as raw_player_name
+                # (these are the "wrong" players that were created with incorrect names)
+                wrong_player_norm = normalize_name(raw_player_name)
+                cur.execute("""
+                    SELECT id, full_name FROM players 
+                    WHERE normalized_name = %s AND id != %s
+                """, (wrong_player_norm, player_id))
+                wrong_players = cur.fetchall()
+                
+                # Merge entries from wrong players to correct player
+                merged_entries_count = 0
+                for wrong_player_id, wrong_player_name in wrong_players:
+                    # Get all entries from wrong player
+                    cur.execute("""
+                        SELECT id, tournament_id FROM entries 
+                        WHERE player_id = %s
+                    """, (wrong_player_id,))
+                    wrong_entries = cur.fetchall()
+                    
+                    # For each entry, check if correct player already has entry for this tournament
+                    for wrong_entry_id, entry_tournament_id in wrong_entries:
+                        # Check if correct player already has entry for this tournament
+                        cur.execute("""
+                            SELECT id FROM entries 
+                            WHERE tournament_id = %s AND player_id = %s
+                        """, (entry_tournament_id, player_id))
+                        existing_correct_entry = cur.fetchone()
+                        
+                        if existing_correct_entry:
+                            # Correct player already has entry - just deactivate/delete wrong entry
+                            cur.execute("""
+                                DELETE FROM entries WHERE id = %s
+                            """, (wrong_entry_id,))
+                            print(f"MERGED: Deleted duplicate entry {wrong_entry_id} (tournament {entry_tournament_id})")
+                        else:
+                            # No entry for correct player - update wrong entry to point to correct player
+                            cur.execute("""
+                                UPDATE entries 
+                                SET player_id = %s, last_seen_in_source = NOW()
+                                WHERE id = %s
+                            """, (player_id, wrong_entry_id))
+                            merged_entries_count += 1
+                            print(f"MERGED: Updated entry {wrong_entry_id} from player {wrong_player_id} to {player_id}")
+                    
+                    # Delete wrong player (cascade will handle aliases and other references)
+                    cur.execute("DELETE FROM players WHERE id = %s", (wrong_player_id,))
+                    print(f"MERGED: Deleted wrong player {wrong_player_id} ({wrong_player_name}), merged {len(wrong_entries)} entries to player {player_id}")
                 
                 # Get player name for response
                 cur.execute("SELECT full_name FROM players WHERE id = %s", (player_id,))
                 player_row = cur.fetchone()
                 player_full_name = player_row[0] if player_row else "Неизвестно"
                 
-                # Create entry if not exists
-                cur.execute("""
-                    SELECT id FROM entries
-                    WHERE tournament_id = %s AND player_id = %s
-                """, (tournament_id, player_id))
-                existing = cur.fetchone()
-                
-                if not existing:
-                    cur.execute("""
-                        INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
-                        VALUES (%s, %s, 'pending', true, NOW(), NOW())
-                        RETURNING id
-                    """, (tournament_id, player_id))
-                    entry_id = cur.fetchone()[0]
+                # 2. Create/UPSERT entry for tournament (using same logic as import)
+                # Import upsert_entry function for consistency
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
+                if spec and spec.loader:
+                    import_lunda = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(import_lunda)
+                    upsert_entry = import_lunda.upsert_entry
                 else:
-                    entry_id = existing[0]
-                    cur.execute("""
-                        UPDATE entries
-                        SET active = true, last_seen_in_source = NOW()
-                        WHERE id = %s
-                    """, (entry_id,))
+                    # Fallback: manual upsert
+                    def upsert_entry(conn, tournament_id, player_id):
+                        cur = conn.cursor()
+                        cur.execute("""
+                            SELECT id FROM entries
+                            WHERE tournament_id = %s AND player_id = %s
+                        """, (tournament_id, player_id))
+                        existing = cur.fetchone()
+                        if existing:
+                            entry_id = existing[0]
+                            cur.execute("""
+                                UPDATE entries
+                                SET active = true, last_seen_in_source = NOW()
+                                WHERE id = %s
+                            """, (entry_id,))
+                            return (entry_id, False)
+                        else:
+                            cur.execute("""
+                                INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+                                VALUES (%s, %s, 'pending', true, NOW(), NOW())
+                                RETURNING id
+                            """, (tournament_id, player_id))
+                            entry_id = cur.fetchone()[0]
+                            return (entry_id, True)
                 
-                # Update pending status
+                entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
+                print(f"RESOLVED: Entry {'created' if was_new else 'updated'}: entry_id={entry_id}, tournament_id={tournament_id}, player_id={player_id}")
+                
+                # 3. Update pending status to 'resolved'
                 cur.execute("""
                     UPDATE pending_entries
                     SET status = 'resolved',
@@ -3243,6 +3311,8 @@ Username: {username_str}
                 """, (player_id, pending_id))
                 
                 conn.commit()
+                print(f"RESOLVED APPLIED: alias saved + entry created for pending_id={pending_id}, raw_name='{raw_player_name}' -> player_id={player_id}")
+                
                 cur.close()
                 conn.close()
                 
@@ -3311,13 +3381,26 @@ Username: {username_str}
                         s = re.sub(r'\s+', ' ', s)
                         return s
                 
-                # Create new player
+                # Check if player with this normalized_name already exists
                 cur.execute("""
-                    INSERT INTO players (full_name, normalized_name)
-                    VALUES (%s, %s)
-                    RETURNING id
-                """, (raw_player_name, normalized_name))
-                new_player_id = cur.fetchone()[0]
+                    SELECT id, full_name FROM players 
+                    WHERE normalized_name = %s
+                    LIMIT 1
+                """, (normalized_name,))
+                existing_player = cur.fetchone()
+                
+                if existing_player:
+                    # Player already exists - use it instead of creating new
+                    new_player_id, existing_player_name = existing_player
+                    print(f"MERGE: Player with normalized_name '{normalized_name}' already exists: {new_player_id} ({existing_player_name})")
+                else:
+                    # Create new player
+                    cur.execute("""
+                        INSERT INTO players (full_name, normalized_name)
+                        VALUES (%s, %s)
+                        RETURNING id
+                    """, (raw_player_name, normalized_name))
+                    new_player_id = cur.fetchone()[0]
                 
                 # Create alias
                 cur.execute("""
@@ -3326,6 +3409,50 @@ Username: {username_str}
                     ON CONFLICT (normalized_alias) 
                     DO UPDATE SET player_id = EXCLUDED.player_id
                 """, (raw_player_name, normalize_name(raw_player_name), new_player_id, admin_telegram_id))
+                
+                # Find and merge any duplicate players (with same normalized_name but different id)
+                cur.execute("""
+                    SELECT id, full_name FROM players 
+                    WHERE normalized_name = %s AND id != %s
+                """, (normalized_name, new_player_id))
+                duplicate_players = cur.fetchall()
+                
+                # Merge entries from duplicate players
+                merged_count = 0
+                for dup_player_id, dup_player_name in duplicate_players:
+                    # Get all entries from duplicate player
+                    cur.execute("""
+                        SELECT id, tournament_id FROM entries 
+                        WHERE player_id = %s
+                    """, (dup_player_id,))
+                    dup_entries = cur.fetchall()
+                    
+                    # For each entry, check if main player already has entry for this tournament
+                    for dup_entry_id, entry_tournament_id in dup_entries:
+                        # Check if main player already has entry for this tournament
+                        cur.execute("""
+                            SELECT id FROM entries 
+                            WHERE tournament_id = %s AND player_id = %s
+                        """, (entry_tournament_id, new_player_id))
+                        existing_entry = cur.fetchone()
+                        
+                        if existing_entry:
+                            # Main player already has entry - delete duplicate entry
+                            cur.execute("DELETE FROM entries WHERE id = %s", (dup_entry_id,))
+                            print(f"MERGED: Deleted duplicate entry {dup_entry_id} (tournament {entry_tournament_id})")
+                        else:
+                            # No entry for main player - update duplicate entry to point to main player
+                            cur.execute("""
+                                UPDATE entries 
+                                SET player_id = %s, last_seen_in_source = NOW()
+                                WHERE id = %s
+                            """, (new_player_id, dup_entry_id))
+                            merged_count += 1
+                            print(f"MERGED: Updated entry {dup_entry_id} from player {dup_player_id} to {new_player_id}")
+                    
+                    # Delete duplicate player
+                    cur.execute("DELETE FROM players WHERE id = %s", (dup_player_id,))
+                    print(f"MERGED: Deleted duplicate player {dup_player_id} ({dup_player_name}), merged {len(dup_entries)} entries to player {new_player_id}")
                 
                 # Create entry
                 cur.execute("""
@@ -3723,14 +3850,54 @@ async def process_pending_players(limit: int = Query(50, ge=1, le=200)):
         """, (limit,))
         
         rows = cur.fetchall()
+        found_count = len(rows)
         notified_count = 0
+        
+        print(f"PROCESS_PENDING_PLAYERS: found {found_count} pending entries to notify")
         
         for row in rows:
             pending_id, tournament_id, raw_name, normalized_name, candidates_json, tournament_title, starts_at, location = row
             
             try:
-                # Parse candidates (can be already parsed from JSONB or string)
-                candidates = parse_json_maybe(candidates_json)
+                # Recalculate candidates using improved filtering logic
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
+                if spec and spec.loader:
+                    import_lunda = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(import_lunda)
+                    find_candidate_players = import_lunda.find_candidate_players
+                else:
+                    # Fallback: use old candidates from JSON
+                    find_candidate_players = None
+                
+                # Safely parse candidates (JSONB can be already parsed as list/dict)
+                if find_candidate_players:
+                    # Recalculate candidates with improved logic (max 3)
+                    candidates = find_candidate_players(conn, raw_name, normalized_name, limit_display=3, limit_pool=30)
+                else:
+                    # Fallback: safely parse candidates from JSONB
+                    # candidates_json from PostgreSQL JSONB can be:
+                    # - Already parsed (list/dict) if using psycopg2.extras.Json
+                    # - JSON string if fetched as text
+                    if candidates_json is None:
+                        candidates = []
+                    elif isinstance(candidates_json, (list, dict)):
+                        # Already parsed (JSONB returned as Python object)
+                        candidates = candidates_json if isinstance(candidates_json, list) else []
+                    elif isinstance(candidates_json, str):
+                        # JSON string - need to parse
+                        try:
+                            import json
+                            candidates = json.loads(candidates_json)
+                            if not isinstance(candidates, list):
+                                candidates = []
+                        except (json.JSONDecodeError, TypeError):
+                            candidates = []
+                    else:
+                        candidates = []
+                    
+                    # Limit to 3
+                    candidates = candidates[:3] if candidates else []
                 
                 # Format starts_at
                 if starts_at:
@@ -3755,61 +3922,102 @@ async def process_pending_players(limit: int = Query(50, ge=1, le=200)):
 
 Выбери правильного игрока:"""
                 
-                # Build buttons (max 8 candidates)
+                # Build buttons (max 3 candidates)
                 buttons = []
-                for cand in candidates[:8]:
-                    player_name = cand.get('name', 'Неизвестно')
-                    player_id = cand.get('player_id')
-                    if player_id:
-                        buttons.append([InlineKeyboardButton(
-                            player_name,
-                            callback_data=f"bind_resolve_pending:{pending_id}:{player_id}"
-                        )])
+                if candidates:
+                    for cand in candidates[:3]:
+                        player_name = cand.get('name', 'Неизвестно')
+                        player_id = cand.get('player_id')
+                        if player_id:
+                            buttons.append([InlineKeyboardButton(
+                                player_name,
+                                callback_data=f"bind_resolve_pending:{pending_id}:{player_id}"
+                            )])
                 
-                # Add action buttons
+                # Always add "New player" button
                 buttons.append([InlineKeyboardButton(
-                    "➕ Это новый игрок",
+                    "➕ Новый игрок",
                     callback_data=f"bind_resolve_pending_new:{pending_id}"
                 )])
-                buttons.append([InlineKeyboardButton(
-                    "⏸ Отложить",
-                    callback_data=f"bind_resolve_pending_skip:{pending_id}"
-                )])
+                
+                # Add "Skip" button only if there are candidates
+                if candidates:
+                    buttons.append([InlineKeyboardButton(
+                        "⏸ Отложить",
+                        callback_data=f"bind_resolve_pending_skip:{pending_id}"
+                    )])
                 
                 keyboard = InlineKeyboardMarkup(buttons)
                 
-                # Send message to admin
-                result = await bot.send_message(
-                    chat_id=admin_telegram_id,
-                    text=message,
-                    reply_markup=keyboard
-                )
-                
-                # Update notified_at
-                cur.execute("""
-                    UPDATE pending_entries
-                    SET notified_at = NOW()
-                    WHERE id = %s
-                """, (pending_id,))
-                conn.commit()
-                
-                notified_count += 1
-                print(f"PENDING NOTIFIED: pending_id={pending_id}, raw_name={raw_name}, candidates={len(candidates)}")
+                # Send message to admin with error handling
+                try:
+                    result = await bot.send_message(
+                        chat_id=admin_telegram_id,
+                        text=message,
+                        reply_markup=keyboard
+                    )
+                    
+                    # Update notified_at only after successful send
+                    cur.execute("""
+                        UPDATE pending_entries
+                        SET notified_at = NOW()
+                        WHERE id = %s
+                    """, (pending_id,))
+                    conn.commit()
+                    
+                    notified_count += 1
+                    print(f"PENDING NOTIFIED: pending_id={pending_id}, raw_name={raw_name}, candidates={len(candidates)}")
+                    
+                except Exception as send_error:
+                    # Handle Telegram API errors (e.g., Message_too_long)
+                    error_msg = str(send_error)
+                    if "Message_too_long" in error_msg or "message is too long" in error_msg.lower():
+                        # Try to send shorter message
+                        short_message = f"⚠️ Спорное имя: {raw_name}\nТурнир: {tournament_title}\nВыбери игрока:"
+                        try:
+                            result = await bot.send_message(
+                                chat_id=admin_telegram_id,
+                                text=short_message,
+                                reply_markup=keyboard
+                            )
+                            cur.execute("""
+                                UPDATE pending_entries
+                                SET notified_at = NOW()
+                                WHERE id = %s
+                            """, (pending_id,))
+                            conn.commit()
+                            notified_count += 1
+                            print(f"PENDING NOTIFIED (short): pending_id={pending_id}, raw_name={raw_name}")
+                        except Exception as short_error:
+                            # Log full error but don't send to Telegram
+                            print(f"ERROR sending pending {pending_id} (even short version failed): {short_error}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
+                    else:
+                        # Other errors - log full traceback but don't send to Telegram
+                        print(f"ERROR sending pending {pending_id}: {error_msg}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
                 
             except Exception as e:
-                print(f"ERROR notifying pending {pending_id}: {e}")
+                # Catch-all for other errors (parsing, DB, etc.)
+                error_msg = str(e)
+                print(f"ERROR processing pending {pending_id}: {error_msg}")
                 import traceback
                 traceback.print_exc()
+                # Don't update notified_at on error - will retry next time
                 continue
         
         cur.close()
         conn.close()
         
-        print(f"PROCESS_PENDING_PLAYERS: found={len(rows)}, notified={notified_count}")
+        print(f"PROCESS_PENDING_PLAYERS: found={found_count}, notified={notified_count}")
         
         return {
             "ok": True,
-            "found": len(rows),
+            "found": found_count,
             "notified": notified_count
         }
         

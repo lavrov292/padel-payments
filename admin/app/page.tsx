@@ -262,7 +262,7 @@ export default function AdminPage() {
               <tbody>
                 {entries.map((e: any) => (
                   <tr key={e.entry_id} className="border-t border-gray-500 bg-gray-800 text-white">
-                    <td className="py-1 px-2 border border-gray-500">{e.full_name}</td>
+                    <td className="py-1 px-2 border border-gray-500">{e.player_name || e.full_name}</td>
                     <td className="py-1 px-2 border border-gray-500">
                       {e.payment_status}
                       {e.manual_paid && (

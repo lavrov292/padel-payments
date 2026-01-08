@@ -273,16 +273,113 @@ def upsert_tournament(conn, tournament_data, global_last_updated=None):
 def get_levenshtein_threshold(normalized_name_len):
     """
     Get dynamic threshold for Levenshtein distance based on name length.
-    - len <= 12 -> 1
-    - 13..20 -> 2
-    - > 20 -> 3
+    - len <= 8  -> max_dist = 2
+    - 9..14     -> max_dist = 3
+    - 15..22    -> max_dist = 4
+    - > 22      -> max_dist = 5
     """
-    if normalized_name_len <= 12:
-        return 1
-    elif normalized_name_len <= 20:
+    if normalized_name_len <= 8:
         return 2
-    else:
+    elif normalized_name_len <= 14:
         return 3
+    elif normalized_name_len <= 22:
+        return 4
+    else:
+        return 5
+
+def split_name_tokens(normalized_name):
+    """
+    Split normalized name into tokens (surname, name, etc.).
+    Returns: (surname, name) or (full_name, None) if single token
+    """
+    tokens = normalized_name.split()
+    if len(tokens) >= 2:
+        return (tokens[0], tokens[1])
+    elif len(tokens) == 1:
+        return (tokens[0], None)
+    else:
+        return (normalized_name, None)
+
+def calculate_candidate_score(full_dist, surname_dist, name_dist):
+    """
+    Calculate score for candidate sorting.
+    Lower score = better match.
+    score = levenshtein(full) * 10 + levenshtein(surname) * 3 + levenshtein(name) * 3
+    """
+    surname_score = surname_dist * 3 if surname_dist is not None else 0
+    name_score = name_dist * 3 if name_dist is not None else 0
+    return full_dist * 10 + surname_score + name_score
+
+def levenshtein_distance(cur, str1, str2):
+    """
+    Calculate Levenshtein distance using PostgreSQL function.
+    Returns distance or None on error.
+    """
+    if not str1 or not str2:
+        return None
+    try:
+        cur.execute("SELECT levenshtein(%s::text, %s::text)", (str1, str2))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except:
+        return None
+
+def passes_similarity_filter(cur, input_norm, input_surname, input_name, candidate_norm, candidate_surname, candidate_name, full_dist, max_dist):
+    """
+    Check if candidate passes similarity filter using multiple heuristics.
+    Returns: (passes: bool, surname_dist: int, name_dist: int)
+    """
+    # Calculate surname and name distances
+    surname_dist = None
+    name_dist = None
+    
+    if input_surname and candidate_surname:
+        surname_dist = levenshtein_distance(cur, input_surname, candidate_surname)
+    
+    if input_name and candidate_name:
+        name_dist = levenshtein_distance(cur, input_name, candidate_name)
+    
+    # Heuristic 1: Full name Levenshtein within max_dist
+    if full_dist <= max_dist:
+        # Heuristic 2: Surname and name separately
+        if surname_dist is not None and name_dist is not None:
+            if surname_dist <= 1 and name_dist <= 1:
+                return (True, surname_dist, name_dist)
+        
+        # Heuristic 3: Missing first letter of surname
+        if input_surname and candidate_surname:
+            if len(input_surname) > 1 and len(candidate_surname) > 1:
+                if input_surname[1:] == candidate_surname or candidate_surname[1:] == input_surname:
+                    if name_dist is not None and name_dist <= 1:
+                        return (True, surname_dist or 0, name_dist)
+        
+        # Heuristic 4: First letter differs but rest matches
+        if input_surname and candidate_surname:
+            if len(input_surname) > 1 and len(candidate_surname) > 1:
+                if input_surname[1:] == candidate_surname[1:]:
+                    if name_dist is not None and name_dist <= 1:
+                        return (True, surname_dist or 0, name_dist)
+        
+        # Default: pass if full_dist <= max_dist
+        return (True, surname_dist, name_dist)
+    
+    # Heuristic 5: Allow slightly beyond max_dist if other heuristics pass
+    if full_dist <= max_dist + 2:
+        # Check heuristics 2-4 even if full_dist is slightly higher
+        if surname_dist is not None and name_dist is not None:
+            if surname_dist <= 1 and name_dist <= 1:
+                return (True, surname_dist, name_dist)
+        
+        if input_surname and candidate_surname:
+            if len(input_surname) > 1 and len(candidate_surname) > 1:
+                if input_surname[1:] == candidate_surname or candidate_surname[1:] == input_surname:
+                    if name_dist is not None and name_dist <= 1:
+                        return (True, surname_dist or 0, name_dist)
+                if input_surname[1:] == candidate_surname[1:]:
+                    if name_dist is not None and name_dist <= 1:
+                        return (True, surname_dist or 0, name_dist)
+    
+    return (False, None, None)
 
 def resolve_player(conn, raw_name):
     """
@@ -326,79 +423,101 @@ def resolve_player(conn, raw_name):
         cur.close()
         return (row[0], None)  # Exact match
     
-    # 3. Find candidates by Levenshtein
-    threshold = get_levenshtein_threshold(norm_len)
-    candidates = []
-    best_dist = None
-    
-    try:
-        cur.execute("""
-            SELECT id, full_name, 
-                   levenshtein(normalized_name, %s::text) AS dist
-            FROM players
-            WHERE normalized_name IS NOT NULL
-            ORDER BY dist ASC
-            LIMIT 6
-        """, (norm,))
-        rows = cur.fetchall()
-        
-        for player_id, name, dist in rows:
-            candidates.append({
-                'player_id': player_id,
-                'name': name,
-                'dist': dist
-            })
-            if best_dist is None:
-                best_dist = dist
-        
-        print(f"FUZZY MATCH: input=\"{raw_name}\", candidates={len(candidates)}, threshold={threshold}")
-    except psycopg2.Error as e:
-        error_msg = str(e).lower()
-        if 'levenshtein' in error_msg or 'fuzzystrmatch' in error_msg or 'does not exist' in error_msg:
-            print(f"LEVENSHTEIN DISABLED: {e}")
-            print(f"FUZZY MATCH FALLBACK: disabled")
-            candidates = []
-            best_dist = None
-        else:
-            # Re-raise if it's a different error
-            raise
-    
+    # 3. Find candidates using improved filtering
     cur.close()
+    candidates = find_candidate_players(conn, raw_name, norm, limit_display=3, limit_pool=30)
     
-    # 4. Check threshold
-    if candidates and best_dist is not None:
-        if best_dist <= threshold:
-            return (None, candidates)  # Ambiguous - needs admin decision
+    # 4. Check if we have candidates
+    if candidates:
+        # Check if best candidate is very confident (optional auto-approve)
+        # For now, we always require admin decision if candidates exist
+        # But we could auto-approve if best_dist == 0 (already handled by exact match above)
+        # or if single candidate with very low score
+        best_candidate = candidates[0]
+        best_dist = best_candidate['dist']
+        threshold = get_levenshtein_threshold(norm_len)
+        
+        # If we have candidates that passed the filter, they are ambiguous
+        return (None, candidates)  # Ambiguous - needs admin decision
     
-    # 5. New player (no candidates or best_dist > threshold)
+    # 5. New player (no candidates passed the filter)
     return (None, [])
 
-def find_candidate_players(conn, normalized_name, limit=6):
+def find_candidate_players(conn, raw_name, normalized_name, limit_display=3, limit_pool=30):
     """
-    Find candidate players by Levenshtein distance.
-    Returns list of {player_id, name, dist}.
-    Falls back to empty list if Levenshtein extension is not available.
+    Find candidate players with improved filtering and scoring.
+    Returns list of {player_id, name, dist, score, surname_dist, name_dist}.
+    Only returns candidates that pass similarity filter.
     """
+    if not normalized_name:
+        return []
+    
     cur = conn.cursor()
     candidates = []
+    max_dist = get_levenshtein_threshold(len(normalized_name))
+    
+    # Split input name into tokens
+    input_surname, input_name = split_name_tokens(normalized_name)
     
     try:
+        # Get expanded pool from DB (TOP 30 by full Levenshtein)
         cur.execute("""
-            SELECT id, full_name, 
+            SELECT id, full_name, normalized_name,
                    levenshtein(normalized_name, %s::text) AS dist
             FROM players
             WHERE normalized_name IS NOT NULL
             ORDER BY dist ASC
             LIMIT %s
-        """, (normalized_name, limit))
-        rows = cur.fetchall()
+        """, (normalized_name, limit_pool))
+        pool_rows = cur.fetchall()
         
-        for player_id, name, dist in rows:
-            candidates.append({
-                'player_id': player_id,
-                'name': name,
-                'dist': dist
-            })
+        print(f"FUZZY MATCH: input=\"{raw_name}\", max_dist={max_dist}, pool_size={len(pool_rows)}")
+        
+        # Filter candidates using heuristics
+        filtered_candidates = []
+        for player_id, full_name, candidate_norm, full_dist in pool_rows:
+            # Skip if too far even for extended check
+            if full_dist > max_dist + 2:
+                continue
+            
+            # Split candidate name
+            candidate_surname, candidate_name = split_name_tokens(candidate_norm)
+            
+            # Check if passes similarity filter
+            passes, surname_dist, name_dist = passes_similarity_filter(
+                cur, normalized_name, input_surname, input_name,
+                candidate_norm, candidate_surname, candidate_name,
+                full_dist, max_dist
+            )
+            
+            if passes:
+                # Calculate score
+                score = calculate_candidate_score(
+                    full_dist,
+                    surname_dist if surname_dist is not None else 999,
+                    name_dist if name_dist is not None else 999
+                )
+                
+                filtered_candidates.append({
+                    'player_id': player_id,
+                    'name': full_name,
+                    'dist': full_dist,
+                    'score': score,
+                    'surname_dist': surname_dist,
+                    'name_dist': name_dist
+                })
+        
+        # Sort by score (lower is better)
+        filtered_candidates.sort(key=lambda x: x['score'])
+        
+        # Take top limit_display
+        candidates = filtered_candidates[:limit_display]
+        
+        print(f"FUZZY MATCH: filtered={len(filtered_candidates)}, top_candidates={len(candidates)}")
+        if candidates:
+            top_info = ", ".join([f"{c['name']}(dist={c['dist']},score={c['score']})" for c in candidates[:3]])
+            print(f"FUZZY MATCH: top_candidates={top_info}")
+        
     except psycopg2.Error as e:
         error_msg = str(e).lower()
         if 'levenshtein' in error_msg or 'fuzzystrmatch' in error_msg or 'does not exist' in error_msg:
@@ -443,8 +562,8 @@ def upsert_player(conn, full_name):
             INSERT INTO players (full_name)
             VALUES (%s)
             ON CONFLICT (full_name) DO NOTHING
-            RETURNING id
-        """, (full_name,))
+        RETURNING id
+    """, (full_name,))
     
     row = cur.fetchone()
     if row:
@@ -533,48 +652,78 @@ def upsert_entry(conn, tournament_id, player_id):
 
 def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, normalized_name, payload, candidates):
     """
-    Create or update pending_entry.
+    Create or update pending_entry with unique constraint.
+    Uses ON CONFLICT to handle duplicates based on (tournament_id, normalized_name, status='pending').
     Returns pending_entry_id.
     """
     cur = conn.cursor()
     import json
     
-    # Try to find existing pending entry
+    # Try to find existing pending entry with status='pending'
     cur.execute("""
         SELECT id FROM pending_entries
-        WHERE sync_run_id = %s 
-          AND tournament_id = %s 
+        WHERE tournament_id = %s 
           AND normalized_name = %s
-          AND raw_player_name = %s
+          AND status = 'pending'
         LIMIT 1
-    """, (sync_run_id, tournament_id, normalized_name, raw_player_name))
+    """, (tournament_id, normalized_name))
     
     row = cur.fetchone()
     if row:
-        # Update existing
+        # Update existing pending entry
         pending_id = row[0]
         cur.execute("""
             UPDATE pending_entries
-            SET candidates = %s, status = 'pending', created_at = NOW()
+            SET candidates = %s, 
+                raw_player_name = %s,
+                payload = %s,
+                sync_run_id = %s,
+                created_at = NOW()
             WHERE id = %s
-        """, (json.dumps(candidates), pending_id))
+        """, (json.dumps(candidates), raw_player_name, json.dumps(payload), sync_run_id, pending_id))
     else:
-        # Create new
-        cur.execute("""
-            INSERT INTO pending_entries 
-            (sync_run_id, tournament_id, raw_player_name, normalized_name, payload, candidates, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'pending')
-            RETURNING id
-        """, (
-            sync_run_id,
-            tournament_id,
-            raw_player_name,
-            normalized_name,
-            json.dumps(payload),
-            json.dumps(candidates)
-        ))
-        row = cur.fetchone()
-        pending_id = row[0] if row else None
+        # Create new pending entry
+        # Unique index ensures no duplicates (tournament_id + normalized_name where status='pending')
+        try:
+            cur.execute("""
+                INSERT INTO pending_entries 
+                (sync_run_id, tournament_id, raw_player_name, normalized_name, payload, candidates, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                RETURNING id
+            """, (
+                sync_run_id,
+                tournament_id,
+                raw_player_name,
+                normalized_name,
+                json.dumps(payload),
+                json.dumps(candidates)
+            ))
+            row = cur.fetchone()
+            pending_id = row[0] if row else None
+        except (psycopg2.IntegrityError, psycopg2.errors.UniqueViolation) as e:
+            # Unique constraint violation - entry already exists, get and update it
+            cur.execute("""
+                SELECT id FROM pending_entries
+                WHERE tournament_id = %s 
+                  AND normalized_name = %s
+                  AND status = 'pending'
+                LIMIT 1
+            """, (tournament_id, normalized_name))
+            row = cur.fetchone()
+            if row:
+                pending_id = row[0]
+                # Update it
+                cur.execute("""
+                    UPDATE pending_entries
+                    SET candidates = %s, 
+                        raw_player_name = %s,
+                        payload = %s,
+                        sync_run_id = %s,
+                        created_at = NOW()
+                    WHERE id = %s
+                """, (json.dumps(candidates), raw_player_name, json.dumps(payload), sync_run_id, pending_id))
+            else:
+                pending_id = None
     
     conn.commit()
     cur.close()
@@ -610,26 +759,31 @@ def send_pending_notification_to_admin(bot_token, admin_chat_id, pending_id, tou
 
 Выбери кто это:"""
         
-        # Build buttons
+        # Build buttons (max 3 candidates)
         buttons = []
-        for cand in candidates[:6]:  # Max 6 candidates
-            name = cand['name']
-            dist = cand['dist']
-            player_id = cand['player_id']
-            button_text = f"{name} (dist={dist})"
-            buttons.append([InlineKeyboardButton(
-                button_text,
-                callback_data=f"pending_approve:{pending_id}:{player_id}"
-            )])
+        if candidates:
+            for cand in candidates[:3]:  # Max 3 candidates
+                name = cand.get('name', 'Неизвестно')
+                player_id = cand.get('player_id')
+                if player_id:
+                    # Show name only (no dist in button text for cleaner UI)
+                    buttons.append([InlineKeyboardButton(
+                        name,
+                        callback_data=f"pending_approve:{pending_id}:{player_id}"
+                    )])
         
+        # Always add "New player" button
         buttons.append([InlineKeyboardButton(
-            "➕ Это новый игрок",
+            "➕ Новый игрок",
             callback_data=f"pending_new_player:{pending_id}"
         )])
-        buttons.append([InlineKeyboardButton(
-            "❌ Игнор",
-            callback_data=f"pending_reject:{pending_id}"
-        )])
+        
+        # Add "Skip" button only if there are candidates
+        if candidates:
+            buttons.append([InlineKeyboardButton(
+                "⏸ Отложить",
+                callback_data=f"pending_reject:{pending_id}"
+            )])
         
         keyboard = InlineKeyboardMarkup(buttons)
         
@@ -740,8 +894,8 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
             else:
                 stats['entries_existing'] += 1
         elif candidates:
-            # Ambiguous case - best_dist <= threshold
-            # Create pending entry for admin decision
+            # Ambiguous case - candidates found (>= 1)
+            # Create ONLY pending entry, DO NOT create player or entry
             norm = normalize_name(participant_name)
             payload = {
                 'tournament_id': tournament_id,
@@ -755,6 +909,9 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
             )
             
             if pending_id:
+                print(f"PENDING CREATED: {participant_name} -> {len(candidates)} candidates, pending_id={pending_id}")
+                print(f"  -> NOT creating player/entry, waiting for admin resolution")
+                
                 # Send notification to admin
                 message_id = send_pending_notification_to_admin(
                     bot_token, admin_chat_id, pending_id,
@@ -770,22 +927,22 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
                         WHERE id = %s
                     """, (message_id, pending_id))
                     conn.commit()
-                
-                print(f"PENDING: {participant_name} -> {len(candidates)} candidates, pending_id={pending_id}")
+            else:
+                print(f"PENDING ERROR: Failed to create pending entry for {participant_name}")
         else:
             # New player - create player and entry
             norm = normalize_name(participant_name)
-            player_id = upsert_player(conn, participant_name)
+        player_id = upsert_player(conn, participant_name)
             
-            if player_id not in processed_player_ids:
-                stats['players_upsert'] += 1
-                processed_player_ids.add(player_id)
-            
-            entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
-            if was_new:
-                stats['entries_new'] += 1
-            else:
-                stats['entries_existing'] += 1
+        if player_id not in processed_player_ids:
+            stats['players_upsert'] += 1
+            processed_player_ids.add(player_id)
+        
+        entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
+        if was_new:
+            stats['entries_new'] += 1
+        else:
+            stats['entries_existing'] += 1
             
             # Optional: send info to admin about new player
             if bot_token and admin_chat_id:
@@ -1026,8 +1183,15 @@ def main():
     # Log run start
     pid = os.getpid()
     now_local = datetime.now(MSK_TZ)
+    
+    # Detect if running from launchd (automatic) or manually
+    # launchd sets certain environment variables, but we can use a custom one
+    is_automatic = os.getenv("LAUNCHD_AUTO_RUN", "false").lower() == "true"
+    run_type = "AUTOMATIC (launchd)" if is_automatic else "MANUAL"
+    
     print("="*50)
     print(f"RUN START: PID={pid}, Time={now_local.strftime('%Y-%m-%d %H:%M:%S %z')} MSK")
+    print(f"RUN TYPE: {run_type}")
     print("="*50)
     
     # Get paths from env
