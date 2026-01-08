@@ -1233,6 +1233,48 @@ async def mark_manual_paid(entry_id: int, body: dict = Body(...)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.delete("/admin/entries/{entry_id}")
+async def delete_entry(entry_id: int):
+    """
+    Удаляет entry. Используется для удаления неактуальных оплаченных записей.
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return {"ok": False, "error": "missing DATABASE_URL"}
+    
+    try:
+        conn = psycopg2.connect(database_url, sslmode="require")
+        cur = conn.cursor()
+        
+        # Проверяем, что entry существует
+        cur.execute("""
+            SELECT id, payment_status, manual_paid, player_id, tournament_id
+            FROM entries
+            WHERE id = %s
+        """, (entry_id,))
+        row = cur.fetchone()
+        
+        if not row:
+            cur.close()
+            conn.close()
+            return {"ok": False, "error": "entry not found"}
+        
+        entry_id_db, payment_status, manual_paid, player_id, tournament_id = row
+        
+        # Удаляем entry
+        cur.execute("DELETE FROM entries WHERE id = %s", (entry_id,))
+        conn.commit()
+        
+        cur.close()
+        conn.close()
+        
+        print(f"ENTRY DELETED: entry_id={entry_id}, payment_status={payment_status}, manual_paid={manual_paid}, player_id={player_id}, tournament_id={tournament_id}")
+        
+        return {"ok": True, "message": f"Entry {entry_id} deleted successfully"}
+    except Exception as e:
+        print(f"DELETE ENTRY ERROR: {str(e)}")
+        return {"ok": False, "error": str(e)}
+
 @app.post("/admin/entries/{entry_id}/ensure-payment")
 def ensure_entry_payment(entry_id: int):
     database_url = os.getenv("DATABASE_URL")
@@ -1769,6 +1811,7 @@ Username: {username_str}
                 player_id = player_row[0]
                 
                 # Query future tournaments (starts_at > now(), strictly future)
+                # Only show active tournaments (active=true, archived_at IS NULL) - same as in admin panel
                 query = """
                     SELECT 
                         e.id as entry_id,
@@ -1782,6 +1825,8 @@ Username: {username_str}
                     JOIN tournaments t ON e.tournament_id = t.id
                     WHERE e.player_id = %s 
                       AND t.starts_at > NOW()
+                      AND t.active = true
+                      AND t.archived_at IS NULL
                     ORDER BY t.starts_at ASC
                 """
                 
@@ -3342,9 +3387,9 @@ Username: {username_str}
                 conn = psycopg2.connect(database_url, sslmode="require")
                 cur = conn.cursor()
                 
-                # Get pending entry
+                # Get pending entry with payload
                 cur.execute("""
-                    SELECT status, raw_player_name, normalized_name, tournament_id
+                    SELECT status, raw_player_name, normalized_name, tournament_id, payload
                     FROM pending_entries
                     WHERE id = %s
                 """, (pending_id,))
@@ -3356,7 +3401,7 @@ Username: {username_str}
                     conn.close()
                     return {"ok": True}
                 
-                pending_status, raw_player_name, normalized_name, tournament_id = pending_row
+                pending_status, raw_player_name, normalized_name, tournament_id, payload_json = pending_row
                 
                 if pending_status != 'pending':
                     await bot.answer_callback_query(callback_query["id"], text="Уже обработан")
@@ -3364,7 +3409,7 @@ Username: {username_str}
                     conn.close()
                     return {"ok": True}
                 
-                # Import normalize_name
+                # Import normalize_name and upsert_entry
                 import sys
                 import importlib.util
                 spec = importlib.util.spec_from_file_location("import_lunda", "scripts/import_lunda.py")
@@ -3372,6 +3417,7 @@ Username: {username_str}
                     import_lunda = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(import_lunda)
                     normalize_name = import_lunda.normalize_name
+                    upsert_entry = import_lunda.upsert_entry
                 else:
                     def normalize_name(s):
                         if not s:
@@ -3380,89 +3426,57 @@ Username: {username_str}
                         s = s.strip().lower().replace('ё', 'е')
                         s = re.sub(r'\s+', ' ', s)
                         return s
+                    def upsert_entry(conn, tournament_id, player_id):
+                        cur = conn.cursor()
+                        cur.execute("""
+                            SELECT id FROM entries
+                            WHERE tournament_id = %s AND player_id = %s
+                        """, (tournament_id, player_id))
+                        existing = cur.fetchone()
+                        if existing:
+                            entry_id = existing[0]
+                            cur.execute("""
+                                UPDATE entries
+                                SET active = true, last_seen_in_source = NOW()
+                                WHERE id = %s
+                            """, (entry_id,))
+                            return (entry_id, False)
+                        else:
+                            cur.execute("""
+                                INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
+                                VALUES (%s, %s, 'pending', true, NOW(), NOW())
+                                RETURNING id
+                            """, (tournament_id, player_id))
+                            entry_id = cur.fetchone()[0]
+                            return (entry_id, True)
                 
-                # Check if player with this normalized_name already exists
+                # 1. Create new player (admin explicitly chose "New player" - always create)
                 cur.execute("""
-                    SELECT id, full_name FROM players 
-                    WHERE normalized_name = %s
-                    LIMIT 1
-                """, (normalized_name,))
-                existing_player = cur.fetchone()
+                    INSERT INTO players (full_name, normalized_name)
+                    VALUES (%s, %s)
+                    RETURNING id
+                """, (raw_player_name, normalized_name))
+                new_player_id = cur.fetchone()[0]
+                print(f"RESOLVED_NEW_PLAYER: Created player_id={new_player_id}, full_name='{raw_player_name}'")
                 
-                if existing_player:
-                    # Player already exists - use it instead of creating new
-                    new_player_id, existing_player_name = existing_player
-                    print(f"MERGE: Player with normalized_name '{normalized_name}' already exists: {new_player_id} ({existing_player_name})")
-                else:
-                    # Create new player
-                    cur.execute("""
-                        INSERT INTO players (full_name, normalized_name)
-                        VALUES (%s, %s)
-                        RETURNING id
-                    """, (raw_player_name, normalized_name))
-                    new_player_id = cur.fetchone()[0]
-                
-                # Create alias
+                # 2. Create alias (raw_name -> new_player_id)
+                alias_normalized = normalize_name(raw_player_name)
                 cur.execute("""
                     INSERT INTO player_aliases (alias_name, normalized_alias, player_id, created_by_telegram_id)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (normalized_alias) 
-                    DO UPDATE SET player_id = EXCLUDED.player_id
-                """, (raw_player_name, normalize_name(raw_player_name), new_player_id, admin_telegram_id))
+                    DO UPDATE SET 
+                        player_id = EXCLUDED.player_id,
+                        alias_name = EXCLUDED.alias_name,
+                        created_by_telegram_id = EXCLUDED.created_by_telegram_id
+                """, (raw_player_name, alias_normalized, new_player_id, admin_telegram_id))
+                print(f"RESOLVED_ALIAS_CREATED: '{raw_player_name}' -> player_id={new_player_id}")
                 
-                # Find and merge any duplicate players (with same normalized_name but different id)
-                cur.execute("""
-                    SELECT id, full_name FROM players 
-                    WHERE normalized_name = %s AND id != %s
-                """, (normalized_name, new_player_id))
-                duplicate_players = cur.fetchall()
+                # 3. Create/UPSERT entry for tournament (using upsert_entry for consistency)
+                entry_id, was_new = upsert_entry(conn, tournament_id, new_player_id)
+                print(f"RESOLVED: Entry {'created' if was_new else 'updated'}: entry_id={entry_id}, tournament_id={tournament_id}")
                 
-                # Merge entries from duplicate players
-                merged_count = 0
-                for dup_player_id, dup_player_name in duplicate_players:
-                    # Get all entries from duplicate player
-                    cur.execute("""
-                        SELECT id, tournament_id FROM entries 
-                        WHERE player_id = %s
-                    """, (dup_player_id,))
-                    dup_entries = cur.fetchall()
-                    
-                    # For each entry, check if main player already has entry for this tournament
-                    for dup_entry_id, entry_tournament_id in dup_entries:
-                        # Check if main player already has entry for this tournament
-                        cur.execute("""
-                            SELECT id FROM entries 
-                            WHERE tournament_id = %s AND player_id = %s
-                        """, (entry_tournament_id, new_player_id))
-                        existing_entry = cur.fetchone()
-                        
-                        if existing_entry:
-                            # Main player already has entry - delete duplicate entry
-                            cur.execute("DELETE FROM entries WHERE id = %s", (dup_entry_id,))
-                            print(f"MERGED: Deleted duplicate entry {dup_entry_id} (tournament {entry_tournament_id})")
-                        else:
-                            # No entry for main player - update duplicate entry to point to main player
-                            cur.execute("""
-                                UPDATE entries 
-                                SET player_id = %s, last_seen_in_source = NOW()
-                                WHERE id = %s
-                            """, (new_player_id, dup_entry_id))
-                            merged_count += 1
-                            print(f"MERGED: Updated entry {dup_entry_id} from player {dup_player_id} to {new_player_id}")
-                    
-                    # Delete duplicate player
-                    cur.execute("DELETE FROM players WHERE id = %s", (dup_player_id,))
-                    print(f"MERGED: Deleted duplicate player {dup_player_id} ({dup_player_name}), merged {len(dup_entries)} entries to player {new_player_id}")
-                
-                # Create entry
-                cur.execute("""
-                    INSERT INTO entries (tournament_id, player_id, payment_status, active, first_seen_in_source, last_seen_in_source)
-                    VALUES (%s, %s, 'pending', true, NOW(), NOW())
-                    RETURNING id
-                """, (tournament_id, new_player_id))
-                entry_id = cur.fetchone()[0]
-                
-                # Update pending status
+                # 4. Update pending status to 'resolved'
                 cur.execute("""
                     UPDATE pending_entries
                     SET status = 'resolved',
@@ -3472,10 +3486,12 @@ Username: {username_str}
                 """, (new_player_id, pending_id))
                 
                 conn.commit()
+                print(f"RESOLVED APPLIED: new player created, alias saved, entry created for pending_id={pending_id}")
+                
                 cur.close()
                 conn.close()
                 
-                await bot.send_message(chat_id=chat_id, text=f"✅ Создан новый игрок: {raw_player_name}. Участие добавлено.")
+                await bot.send_message(chat_id=chat_id, text=f"✅ Создан новый игрок: {raw_player_name} (id={new_player_id}). Участие добавлено.")
                 return {"ok": True}
             except Exception as e:
                 print(f"BIND RESOLVE PENDING NEW ERROR: {str(e)}")
@@ -3923,12 +3939,15 @@ async def process_pending_players(limit: int = Query(50, ge=1, le=200)):
 Выбери правильного игрока:"""
                 
                 # Build buttons (max 3 candidates)
+                # CRITICAL: Filter out any candidate where name == raw_name (prevent showing "wrong" name)
                 buttons = []
                 if candidates:
-                    for cand in candidates[:3]:
+                    filtered_candidates = [c for c in candidates if c.get('name') != raw_name]
+                    for cand in filtered_candidates[:3]:
                         player_name = cand.get('name', 'Неизвестно')
                         player_id = cand.get('player_id')
-                        if player_id:
+                        # Double check: never show raw_name as candidate
+                        if player_id and player_name != raw_name:
                             buttons.append([InlineKeyboardButton(
                                 player_name,
                                 callback_data=f"bind_resolve_pending:{pending_id}:{player_id}"
@@ -3936,7 +3955,7 @@ async def process_pending_players(limit: int = Query(50, ge=1, le=200)):
                 
                 # Always add "New player" button
                 buttons.append([InlineKeyboardButton(
-                    "➕ Новый игрок",
+                    "🆕 Новый игрок",
                     callback_data=f"bind_resolve_pending_new:{pending_id}"
                 )])
                 

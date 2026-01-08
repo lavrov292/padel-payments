@@ -381,27 +381,23 @@ def passes_similarity_filter(cur, input_norm, input_surname, input_name, candida
     
     return (False, None, None)
 
-def resolve_player(conn, raw_name):
+def resolve_player_id(conn, input_full_name, sync_run_id, tournament_id):
     """
-    Resolve player by name using hybrid logic:
-    1. Try alias
-    2. Try exact normalized match
-    3. Find candidates by Levenshtein
-    4. Check threshold
+    Unified function to resolve player_id from input name.
+    Order: alias -> exact -> fuzzy -> new
     
     Returns:
-    - (player_id, None) if exact match found
-    - (None, candidates) if ambiguous (best_dist <= threshold)
-    - (None, []) if new player (no candidates or best_dist > threshold)
+    - (player_id, "resolved") if alias/exact found
+    - (None, "pending_created") if pending created (has candidates <= threshold)
+    - (new_player_id, "new_player_created") if new player created automatically (no candidates)
     """
-    if not raw_name:
-        return (None, [])
+    if not input_full_name:
+        return (None, None)
     
-    norm = normalize_name(raw_name)
-    norm_len = len(norm)
+    norm = normalize_name(input_full_name)
     cur = conn.cursor()
     
-    # 1. Try alias first
+    # 1. Try alias first (normalized_alias)
     cur.execute("""
         SELECT player_id FROM player_aliases 
         WHERE normalized_alias = %s
@@ -410,38 +406,67 @@ def resolve_player(conn, raw_name):
     row = cur.fetchone()
     if row:
         cur.close()
-        return (row[0], None)  # Exact match via alias
+        print(f"RESOLVE: alias_hit '{input_full_name}' -> player_id={row[0]}")
+        return (row[0], "resolved")
     
-    # 2. Try exact normalized match
+    # 2. Try exact match by full_name (case-sensitive)
     cur.execute("""
         SELECT id FROM players 
-        WHERE normalized_name = %s
+        WHERE full_name = %s
         LIMIT 1
-    """, (norm,))
+    """, (input_full_name,))
     row = cur.fetchone()
     if row:
         cur.close()
-        return (row[0], None)  # Exact match
+        print(f"RESOLVE: exact_hit '{input_full_name}' -> player_id={row[0]}")
+        return (row[0], "resolved")
     
-    # 3. Find candidates using improved filtering
+    # 3. Find candidates using fuzzy matching
     cur.close()
-    candidates = find_candidate_players(conn, raw_name, norm, limit_display=3, limit_pool=30)
+    candidates = find_candidate_players(conn, input_full_name, norm, limit_display=5, limit_pool=30)
     
-    # 4. Check if we have candidates
-    if candidates:
-        # Check if best candidate is very confident (optional auto-approve)
-        # For now, we always require admin decision if candidates exist
-        # But we could auto-approve if best_dist == 0 (already handled by exact match above)
-        # or if single candidate with very low score
-        best_candidate = candidates[0]
-        best_dist = best_candidate['dist']
-        threshold = get_levenshtein_threshold(norm_len)
+    # Filter candidates: exclude any where full_name == input_full_name
+    filtered_candidates = [c for c in candidates if c.get('name') != input_full_name]
+    
+    # Get threshold for this name length
+    threshold = get_levenshtein_threshold(len(norm))
+    
+    # Filter candidates by threshold: only include those with distance <= threshold
+    threshold_candidates = [c for c in filtered_candidates if c.get('dist', 999) <= threshold]
+    
+    print(f"RESOLVE: fuzzy '{input_full_name}' -> pool={len(filtered_candidates)}, threshold={threshold}, candidates_within_threshold={len(threshold_candidates)}")
+    
+    if threshold_candidates:
+        # Has candidates within threshold -> create pending
+        # Sort by distance and take top 3-5
+        threshold_candidates.sort(key=lambda x: x.get('dist', 999))
+        top_candidates = threshold_candidates[:5]
         
-        # If we have candidates that passed the filter, they are ambiguous
-        return (None, candidates)  # Ambiguous - needs admin decision
-    
-    # 5. New player (no candidates passed the filter)
-    return (None, [])
+        # Create pending entry
+        payload = {
+            'tournament_id': tournament_id,
+            'raw_player_name': input_full_name,
+            'normalized_name': norm
+        }
+        
+        pending_id = create_pending_entry(
+            conn, sync_run_id, tournament_id, 
+            input_full_name, norm, payload, top_candidates
+        )
+        
+        if pending_id:
+            print(f"RESOLVE: fuzzy_pending '{input_full_name}' -> {len(top_candidates)} candidates (threshold={threshold}), pending_id={pending_id}")
+            return (None, "pending_created")
+        else:
+            # Fallback: if pending creation failed, treat as new player
+            print(f"RESOLVE: fuzzy_pending FAILED, falling back to new_player '{input_full_name}'")
+            new_player_id = upsert_player(conn, input_full_name)
+            return (new_player_id, "new_player_created")
+    else:
+        # No candidates within threshold -> create new player automatically
+        print(f"RESOLVE: new_player '{input_full_name}' (no candidates within threshold={threshold})")
+        new_player_id = upsert_player(conn, input_full_name)
+        return (new_player_id, "new_player_created")
 
 def find_candidate_players(conn, raw_name, normalized_name, limit_display=3, limit_pool=30):
     """
@@ -475,10 +500,20 @@ def find_candidate_players(conn, raw_name, normalized_name, limit_display=3, lim
         
         # Filter candidates using heuristics
         filtered_candidates = []
+        minimal_distance = None
+        
         for player_id, full_name, candidate_norm, full_dist in pool_rows:
+            # CRITICAL: Skip candidate if full_name == raw_name (prevent showing "wrong" name in candidates)
+            if full_name == raw_name:
+                continue
+            
             # Skip if too far even for extended check
             if full_dist > max_dist + 2:
                 continue
+            
+            # Track minimal distance
+            if minimal_distance is None or full_dist < minimal_distance:
+                minimal_distance = full_dist
             
             # Split candidate name
             candidate_surname, candidate_name = split_name_tokens(candidate_norm)
@@ -506,6 +541,16 @@ def find_candidate_players(conn, raw_name, normalized_name, limit_display=3, lim
                     'surname_dist': surname_dist,
                     'name_dist': name_dist
                 })
+        
+        # Additional filtering: only include candidates within reasonable distance
+        # If minimal_distance is too large (>3), don't show candidates
+        if minimal_distance is not None and minimal_distance > 3:
+            filtered_candidates = []
+            print(f"FUZZY MATCH: minimal_distance={minimal_distance} > 3, filtering out all candidates")
+        elif minimal_distance is not None:
+            # Only include candidates within min_distance + 1 or threshold_max
+            threshold_max = min(minimal_distance + 1, max_dist)
+            filtered_candidates = [c for c in filtered_candidates if c['dist'] <= threshold_max]
         
         # Sort by score (lower is better)
         filtered_candidates.sort(key=lambda x: x['score'])
@@ -657,7 +702,7 @@ def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, norm
     Returns pending_entry_id.
     """
     cur = conn.cursor()
-    import json
+    from psycopg2.extras import Json
     
     # Try to find existing pending entry with status='pending'
     cur.execute("""
@@ -672,6 +717,7 @@ def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, norm
     if row:
         # Update existing pending entry
         pending_id = row[0]
+        # candidates is already a list/dict - PostgreSQL JSONB will handle it
         cur.execute("""
             UPDATE pending_entries
             SET candidates = %s, 
@@ -680,7 +726,7 @@ def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, norm
                 sync_run_id = %s,
                 created_at = NOW()
             WHERE id = %s
-        """, (json.dumps(candidates), raw_player_name, json.dumps(payload), sync_run_id, pending_id))
+        """, (Json(candidates), raw_player_name, Json(payload), sync_run_id, pending_id))
     else:
         # Create new pending entry
         # Unique index ensures no duplicates (tournament_id + normalized_name where status='pending')
@@ -695,8 +741,8 @@ def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, norm
                 tournament_id,
                 raw_player_name,
                 normalized_name,
-                json.dumps(payload),
-                json.dumps(candidates)
+                Json(payload),
+                Json(candidates)
             ))
             row = cur.fetchone()
             pending_id = row[0] if row else None
@@ -721,7 +767,7 @@ def create_pending_entry(conn, sync_run_id, tournament_id, raw_player_name, norm
                         sync_run_id = %s,
                         created_at = NOW()
                     WHERE id = %s
-                """, (json.dumps(candidates), raw_player_name, json.dumps(payload), sync_run_id, pending_id))
+                """, (Json(candidates), raw_player_name, Json(payload), sync_run_id, pending_id))
             else:
                 pending_id = None
     
@@ -760,22 +806,25 @@ def send_pending_notification_to_admin(bot_token, admin_chat_id, pending_id, tou
 Выбери кто это:"""
         
         # Build buttons (max 3 candidates)
+        # CRITICAL: Filter out any candidate where name == raw_name (prevent showing "wrong" name)
         buttons = []
         if candidates:
-            for cand in candidates[:3]:  # Max 3 candidates
+            filtered_candidates = [c for c in candidates if c.get('name') != raw_player_name]
+            for cand in filtered_candidates[:3]:  # Max 3 candidates
                 name = cand.get('name', 'Неизвестно')
                 player_id = cand.get('player_id')
-                if player_id:
+                # Double check: never show raw_name as candidate
+                if player_id and name != raw_player_name:
                     # Show name only (no dist in button text for cleaner UI)
                     buttons.append([InlineKeyboardButton(
                         name,
-                        callback_data=f"pending_approve:{pending_id}:{player_id}"
+                        callback_data=f"bind_resolve_pending:{pending_id}:{player_id}"
                     )])
         
         # Always add "New player" button
         buttons.append([InlineKeyboardButton(
-            "➕ Новый игрок",
-            callback_data=f"pending_new_player:{pending_id}"
+            "🆕 Новый игрок",
+            callback_data=f"bind_resolve_pending_new:{pending_id}"
         )])
         
         # Add "Skip" button only if there are candidates
@@ -879,11 +928,11 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
         if not participant_name:
             continue
         
-        # Resolve player using hybrid logic
-        player_id, candidates = resolve_player(conn, participant_name)
+        # Resolve player using unified logic
+        player_id, resolution_status = resolve_player_id(conn, participant_name, sync_run_id, tournament_id)
         
-        if player_id:
-            # Exact match found - create/update entry
+        if resolution_status == "resolved":
+            # Alias or exact match found - create/update entry
             if player_id not in processed_player_ids:
                 stats['players_upsert'] += 1
                 processed_player_ids.add(player_id)
@@ -893,22 +942,28 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
                 stats['entries_new'] += 1
             else:
                 stats['entries_existing'] += 1
-        elif candidates:
-            # Ambiguous case - candidates found (>= 1)
-            # Create ONLY pending entry, DO NOT create player or entry
-            norm = normalize_name(participant_name)
-            payload = {
-                'tournament_id': tournament_id,
-                'raw_player_name': participant_name,
-                'normalized_name': norm
-            }
+        elif resolution_status == "pending_created":
+            # Pending created (has candidates within threshold) - DO NOT create player or entry
+            # Get pending_id from last created pending (or we could return it from resolve_player_id)
+            cur.execute("""
+                SELECT id, candidates FROM pending_entries
+                WHERE tournament_id = %s 
+                  AND normalized_name = %s
+                  AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (tournament_id, normalize_name(participant_name)))
+            pending_row = cur.fetchone()
             
-            pending_id = create_pending_entry(
-                conn, sync_run_id, tournament_id, 
-                participant_name, norm, payload, candidates
-            )
-            
-            if pending_id:
+            if pending_row:
+                pending_id, candidates_json = pending_row
+                # Parse candidates if needed
+                if isinstance(candidates_json, list):
+                    candidates = candidates_json
+                else:
+                    import json
+                    candidates = json.loads(candidates_json) if candidates_json else []
+                
                 print(f"PENDING CREATED: {participant_name} -> {len(candidates)} candidates, pending_id={pending_id}")
                 print(f"  -> NOT creating player/entry, waiting for admin resolution")
                 
@@ -928,21 +983,18 @@ def process_tournament(conn, tournament_data, stats, global_last_updated=None, p
                     """, (message_id, pending_id))
                     conn.commit()
             else:
-                print(f"PENDING ERROR: Failed to create pending entry for {participant_name}")
-        else:
-            # New player - create player and entry
-            norm = normalize_name(participant_name)
-        player_id = upsert_player(conn, participant_name)
+                print(f"PENDING ERROR: Failed to find pending entry for {participant_name}")
+        elif resolution_status == "new_player_created":
+            # New player created automatically (no candidates within threshold) - create entry
+            if player_id not in processed_player_ids:
+                stats['players_upsert'] += 1
+                processed_player_ids.add(player_id)
             
-        if player_id not in processed_player_ids:
-            stats['players_upsert'] += 1
-            processed_player_ids.add(player_id)
-        
-        entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
-        if was_new:
-            stats['entries_new'] += 1
-        else:
-            stats['entries_existing'] += 1
+            entry_id, was_new = upsert_entry(conn, tournament_id, player_id)
+            if was_new:
+                stats['entries_new'] += 1
+            else:
+                stats['entries_existing'] += 1
             
             # Optional: send info to admin about new player
             if bot_token and admin_chat_id:

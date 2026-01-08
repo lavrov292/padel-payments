@@ -146,3 +146,5 @@ cat ~/Library/LaunchAgents/com.padel.lunda.import.plist
    launchctl unload ~/Library/LaunchAgents/com.padel.lunda.import.plist
    ```
 
+
+

@@ -55,3 +55,5 @@ echo "  launchctl unload ~/Library/LaunchAgents/com.padel.lunda.import.plist"
 echo "  launchctl load ~/Library/LaunchAgents/com.padel.lunda.import.plist"
 echo "=========================================="
 
+
+

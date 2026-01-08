@@ -260,9 +260,35 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody>
-                {entries.map((e: any) => (
-                  <tr key={e.entry_id} className="border-t border-gray-500 bg-gray-800 text-white">
-                    <td className="py-1 px-2 border border-gray-500">{e.player_name || e.full_name}</td>
+                {entries.map((e: any) => {
+                  // Определяем, актуальна ли запись (active=true или last_seen_in_source недавно)
+                  const isActive = e.active !== false;
+                  const isPaidButInactive = (e.payment_status === 'paid' || e.manual_paid) && !isActive;
+                  
+                  return (
+                  <tr 
+                    key={e.entry_id} 
+                    className={`border-t border-gray-500 text-white ${
+                      isPaidButInactive 
+                        ? 'bg-gray-700 opacity-75' 
+                        : isActive 
+                        ? 'bg-gray-800' 
+                        : 'bg-gray-900 opacity-60'
+                    }`}
+                  >
+                    <td className="py-1 px-2 border border-gray-500">
+                      {e.player_name || e.full_name}
+                      {isPaidButInactive && (
+                        <span className="ml-2 px-1.5 py-0.5 text-xs bg-orange-500 text-white rounded">
+                          Неактуально (оплачено)
+                        </span>
+                      )}
+                      {!isActive && !isPaidButInactive && (
+                        <span className="ml-2 px-1.5 py-0.5 text-xs bg-gray-500 text-white rounded">
+                          Неактуально
+                        </span>
+                      )}
+                    </td>
                     <td className="py-1 px-2 border border-gray-500">
                       {e.payment_status}
                       {e.manual_paid && (
@@ -308,7 +334,80 @@ export default function AdminPage() {
                     </td>
                     <td className="py-1 px-2 border border-gray-500">
                       <div className="flex items-center gap-2 flex-wrap">
-                        {e.payment_status === "paid" ? (
+                        {isPaidButInactive && (
+                          <button
+                            className="px-3 py-1.5 text-xs font-medium bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
+                            onClick={async () => {
+                              if (!confirm(`Удалить запись для "${e.player_name || e.full_name}"? Это действие нельзя отменить.`)) return;
+                              
+                              const res = await fetch(
+                                `${apiBase}/admin/entries/${e.entry_id}`,
+                                {
+                                  method: "DELETE",
+                                  headers: { "Content-Type": "application/json" },
+                                }
+                              );
+                              
+                              const json = await res.json();
+                              if (json.ok) {
+                                // Перезагружаем список entries
+                                const { data: rows } = await supabase
+                                  .from("admin_entries_view")
+                                  .select("*")
+                                  .eq("tournament_id", t.tournament_id);
+                                setEntries(rows || []);
+                                
+                                // Перезагружаем список турниров
+                                const { data: fresh } = await supabase
+                                  .from("tournaments")
+                                  .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source")
+                                  .is("archived_at", null)
+                                  .order("starts_at", { ascending: true });
+                                
+                                const { data: entriesData } = await supabase
+                                  .from("entries")
+                                  .select("tournament_id, payment_status");
+                                
+                                const entriesByTournament = new Map<number, any[]>();
+                                if (entriesData) {
+                                  entriesData.forEach((entry: any) => {
+                                    const tid = entry.tournament_id;
+                                    if (!entriesByTournament.has(tid)) {
+                                      entriesByTournament.set(tid, []);
+                                    }
+                                    entriesByTournament.get(tid)!.push(entry);
+                                  });
+                                }
+                                
+                                const processed = (fresh || []).map((t: any) => {
+                                  const entries = entriesByTournament.get(t.id) || [];
+                                  const paid = entries.filter((e: any) => e.payment_status === 'paid').length;
+                                  const pending = entries.filter((e: any) => e.payment_status === 'pending').length;
+                                  
+                                  return {
+                                    tournament_id: t.id,
+                                    title: t.title,
+                                    starts_at: t.starts_at,
+                                    price_rub: t.price_rub,
+                                    tournament_type: t.tournament_type || 'personal',
+                                    active: t.active !== false,
+                                    archived_at: t.archived_at,
+                                    entries_total: entries.length,
+                                    entries_paid: paid,
+                                    entries_pending: pending
+                                  } as Tournament;
+                                });
+                                
+                                setData(processed);
+                              } else {
+                                alert(`Ошибка: ${json.error || "неизвестная ошибка"}`);
+                              }
+                            }}
+                          >
+                            Удалить
+                          </button>
+                        )}
+                        {e.payment_status === "paid" && isActive ? (
                           <span className="text-green-400 text-xs">Оплачено</span>
                         ) : (
                           <>
@@ -412,7 +511,8 @@ export default function AdminPage() {
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
 
                 {entries.length === 0 && (
                   <tr>
