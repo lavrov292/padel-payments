@@ -37,11 +37,17 @@ export default function AdminPage() {
       setLoading(true);
       setErrorText(null);
 
-      // Load tournaments - only non-archived tournaments
-      const { data: tournamentsData, error: tournamentsError } = await supabase
+      // Load tournaments - show archived if checkbox is checked
+      let query = supabase
         .from("tournaments")
-        .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source")
-        .is("archived_at", null)  // Only show non-archived tournaments
+        .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
+      
+      // Only filter by archived_at if showArchived is false
+      if (!showArchived) {
+        query = query.is("archived_at", null);  // Only show non-archived tournaments
+      }
+      
+      const { data: tournamentsData, error: tournamentsError } = await query
         .order("starts_at", { ascending: true });
       
       if (tournamentsError) {
@@ -103,7 +109,7 @@ export default function AdminPage() {
     }
 
     load();
-  }, []);
+  }, [showArchived]);
 
   if (loading) return <div className="p-6 bg-gray-900 min-h-screen text-white">Загрузка...</div>;
 
@@ -123,8 +129,8 @@ export default function AdminPage() {
   // Filter tournaments
   const now = new Date();
   const filteredData = data.filter((t) => {
-    // Filter by active/archived
-    if (!showArchived && !t.active) {
+    // Filter by archived_at (not active)
+    if (!showArchived && t.archived_at !== null) {
       return false;
     }
     
@@ -194,7 +200,11 @@ export default function AdminPage() {
     <React.Fragment key={t.tournament_id}>
       <tr
         key={t.tournament_id}
-        className="bg-gray-800 text-white cursor-pointer hover:bg-gray-700"
+        className={`text-white cursor-pointer ${
+          t.archived_at !== null 
+            ? 'bg-gray-700 opacity-75 hover:bg-gray-600' 
+            : 'bg-gray-800 hover:bg-gray-700'
+        }`}
         onClick={async () => {
           // toggle
           if (openTournamentId === t.tournament_id) {
@@ -219,8 +229,8 @@ export default function AdminPage() {
       >
         <td className="border border-gray-500 px-2 py-1">
           {t.title}
-          {!t.active && (
-            <span className="ml-2 px-1.5 py-0.5 text-xs bg-gray-500 text-white rounded">
+          {t.archived_at !== null && (
+            <span className="ml-2 px-1.5 py-0.5 text-xs bg-orange-600 text-white rounded">
               Архив
             </span>
           )}
@@ -358,10 +368,15 @@ export default function AdminPage() {
                                 setEntries(rows || []);
                                 
                                 // Перезагружаем список турниров
-                                const { data: fresh } = await supabase
+                                let reloadQuery = supabase
                                   .from("tournaments")
-                                  .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source")
-                                  .is("archived_at", null)
+                                  .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
+                                
+                                if (!showArchived) {
+                                  reloadQuery = reloadQuery.is("archived_at", null);
+                                }
+                                
+                                const { data: fresh } = await reloadQuery
                                   .order("starts_at", { ascending: true });
                                 
                                 const { data: entriesData } = await supabase
@@ -494,10 +509,53 @@ export default function AdminPage() {
                                     setEntries(rows || []);
                                     
                                     // Перезагружаем список турниров
-                                    const { data: fresh } = await supabase
-                                      .from("admin_tournaments_view")
-                                      .select("*");
-                                    setData(fresh || []);
+                                    let reloadQuery = supabase
+                                      .from("tournaments")
+                                      .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
+                                    
+                                    if (!showArchived) {
+                                      reloadQuery = reloadQuery.is("archived_at", null);
+                                    }
+                                    
+                                    const { data: fresh } = await reloadQuery
+                                      .order("starts_at", { ascending: true });
+                                    
+                                    // Load entries separately to count paid/pending
+                                    const { data: entriesData } = await supabase
+                                      .from("entries")
+                                      .select("tournament_id, payment_status");
+                                    
+                                    const entriesByTournament = new Map<number, any[]>();
+                                    if (entriesData) {
+                                      entriesData.forEach((entry: any) => {
+                                        const tid = entry.tournament_id;
+                                        if (!entriesByTournament.has(tid)) {
+                                          entriesByTournament.set(tid, []);
+                                        }
+                                        entriesByTournament.get(tid)!.push(entry);
+                                      });
+                                    }
+                                    
+                                    const processed = (fresh || []).map((t: any) => {
+                                      const entries = entriesByTournament.get(t.id) || [];
+                                      const paid = entries.filter((e: any) => e.payment_status === 'paid').length;
+                                      const pending = entries.filter((e: any) => e.payment_status === 'pending').length;
+                                      
+                                      return {
+                                        tournament_id: t.id,
+                                        title: t.title,
+                                        starts_at: t.starts_at,
+                                        price_rub: t.price_rub,
+                                        tournament_type: t.tournament_type || 'personal',
+                                        active: t.active !== false,
+                                        archived_at: t.archived_at,
+                                        entries_total: entries.length,
+                                        entries_paid: paid,
+                                        entries_pending: pending
+                                      } as Tournament;
+                                    });
+                                    
+                                    setData(processed);
                                   } else {
                                     alert(`Ошибка: ${json.error || "неизвестная ошибка"}`);
                                   }
