@@ -7,6 +7,7 @@ import { supabase } from "@/lib/supabase";
 type Tournament = {
   tournament_id: number;
   title: string;
+  location: string | null;
   starts_at: string;
   price_rub: number;
   tournament_type: string;
@@ -40,7 +41,7 @@ export default function AdminPage() {
       // Load tournaments - show archived if checkbox is checked
       let query = supabase
         .from("tournaments")
-        .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
+        .select("id, title, location, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
       
       // Only filter by archived_at if showArchived is false
       if (!showArchived) {
@@ -85,6 +86,7 @@ export default function AdminPage() {
         return {
           tournament_id: t.id,
           title: t.title,
+          location: t.location || null,
           starts_at: t.starts_at,
           price_rub: t.price_rub,
           tournament_type: t.tournament_type || 'personal',
@@ -186,6 +188,7 @@ export default function AdminPage() {
         <thead>
           <tr className="bg-black text-white">
             <th className="border border-gray-500 px-2 py-1 text-left">Турнир</th>
+            <th className="border border-gray-500 px-2 py-1 text-left">Локация</th>
             <th className="border border-gray-500 px-2 py-1 text-left">Дата</th>
             <th className="border border-gray-500 px-2 py-1 text-left">Тип</th>
             <th className="border border-gray-500 px-2 py-1 text-left">Цена</th>
@@ -236,6 +239,9 @@ export default function AdminPage() {
           )}
         </td>
         <td className="border border-gray-500 px-2 py-1">
+          {t.location || <span className="text-gray-400">—</span>}
+        </td>
+        <td className="border border-gray-500 px-2 py-1">
           {formatMSK(t.starts_at)}
         </td>
         <td className="border border-gray-500 px-2 py-1">
@@ -255,7 +261,7 @@ export default function AdminPage() {
 
       {openTournamentId === t.tournament_id && (
         <tr key={`details-${t.tournament_id}`}>
-          <td colSpan={8} className="border border-gray-500 px-2 py-3 bg-gray-800 text-white">
+          <td colSpan={9} className="border border-gray-500 px-2 py-3 bg-gray-800 text-white">
             <div className="font-semibold mb-2">Участники</div>
 
             <table className="w-full text-sm">
@@ -370,7 +376,7 @@ export default function AdminPage() {
                                 // Перезагружаем список турниров
                                 let reloadQuery = supabase
                                   .from("tournaments")
-                                  .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
+                                  .select("id, title, location, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
                                 
                                 if (!showArchived) {
                                   reloadQuery = reloadQuery.is("archived_at", null);
@@ -402,6 +408,7 @@ export default function AdminPage() {
                                   return {
                                     tournament_id: t.id,
                                     title: t.title,
+                                    location: t.location || null,
                                     starts_at: t.starts_at,
                                     price_rub: t.price_rub,
                                     tournament_type: t.tournament_type || 'personal',
@@ -511,7 +518,7 @@ export default function AdminPage() {
                                     // Перезагружаем список турниров
                                     let reloadQuery = supabase
                                       .from("tournaments")
-                                      .select("id, title, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
+                                      .select("id, title, location, starts_at, price_rub, tournament_type, active, archived_at, first_seen_in_source, last_seen_in_source");
                                     
                                     if (!showArchived) {
                                       reloadQuery = reloadQuery.is("archived_at", null);
@@ -544,6 +551,7 @@ export default function AdminPage() {
                                       return {
                                         tournament_id: t.id,
                                         title: t.title,
+                                        location: t.location || null,
                                         starts_at: t.starts_at,
                                         price_rub: t.price_rub,
                                         tournament_type: t.tournament_type || 'personal',

@@ -1991,7 +1991,7 @@ Username: {username_str}
                 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="Чтобы привязать аккаунт, выбери дату турнира, на который ты УЖЕ записан в Lunda. Это нужно только один раз.",
+                    text="Чтобы привязать аккаунт, выберите дату турнира, на который вы УЖЕ записаны в Lunda. Это нужно только один раз.",
                     reply_markup=keyboard
                 )
                 
@@ -2267,7 +2267,7 @@ Username: {username_str}
                 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"Ты оплачиваешь за пару. Партнер: {partner_name}",
+                    text=f"Вы оплачиваете за пару. Партнер: {partner_name}",
                     reply_markup=keyboard
                 )
                 return {"ok": True}
@@ -2390,7 +2390,7 @@ Username: {username_str}
                 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="Выбери турнир:",
+                    text="Выберите турнир:",
                     reply_markup=keyboard
                 )
                 
@@ -2485,7 +2485,7 @@ Username: {username_str}
                 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="Выбери себя из списка участников:",
+                    text="Выберите себя из списка участников:",
                     reply_markup=keyboard
                 )
                 
@@ -2624,7 +2624,7 @@ Username: {username_str}
                 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"Ты — {player_name}?\n\nТурнир: {tournament_title}\nМесто: {location_str}\nВремя: {starts_at_str}",
+                    text=f"Вы — {player_name}?\n\nТурнир: {tournament_title}\nМесто: {location_str}\nВремя: {starts_at_str}",
                     reply_markup=keyboard
                 )
                 
@@ -2703,7 +2703,7 @@ Username: {username_str}
                     ],
                     resize_keyboard=True
                 )
-                await bot.send_message(chat_id=chat_id, text="Теперь ты можешь использовать все функции бота.", reply_markup=keyboard)
+                await bot.send_message(chat_id=chat_id, text="Теперь вы можете использовать все функции бота.", reply_markup=keyboard)
                 
                 # Send notifications for future entries
                 cur.execute("""
@@ -2748,7 +2748,7 @@ Username: {username_str}
                         
                         if tournament_type == 'team':
                             msg = (
-                                "🎾 Ты записан на турнир!\n\n"
+                                "🎾 Вы записаны на турнир!\n\n"
                                 f"🏷️ {title}\n"
                                 f"📍 {location_str}\n"
                                 f"🕒 {starts_at_str}\n"
@@ -2759,7 +2759,7 @@ Username: {username_str}
                             ])
                         else:
                             msg = (
-                                "🎾 Ты записан на турнир!\n\n"
+                                "🎾 Вы записаны на турнир!\n\n"
                                 f"🏷️ {title}\n"
                                 f"📍 {location_str}\n"
                                 f"🕒 {starts_at_str}\n"
@@ -2843,7 +2843,7 @@ Username: {username_str}
                     keyboard = InlineKeyboardMarkup(buttons)
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="Чтобы привязать аккаунт, выбери дату турнира, на который ты УЖЕ записан в Lunda. Это нужно только один раз.",
+                        text="Чтобы привязать аккаунт, выберите дату турнира, на который вы УЖЕ записаны в Lunda. Это нужно только один раз.",
                         reply_markup=keyboard
                     )
                 elif back_type == "tournament":
@@ -2870,7 +2870,7 @@ Username: {username_str}
                         keyboard = InlineKeyboardMarkup(buttons)
                         await bot.send_message(
                             chat_id=chat_id,
-                            text="Чтобы привязать аккаунт, выбери дату турнира, на который ты УЖЕ записан в Lunda. Это нужно только один раз.",
+                            text="Чтобы привязать аккаунт, выберите дату турнира, на который вы УЖЕ записаны в Lunda. Это нужно только один раз.",
                             reply_markup=keyboard
                         )
                 elif back_type.startswith("player:"):
@@ -2911,7 +2911,7 @@ Username: {username_str}
                     keyboard = InlineKeyboardMarkup(buttons)
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="Выбери себя из списка участников:",
+                        text="Выберите себя из списка участников:",
                         reply_markup=keyboard
                     )
                 
@@ -3760,7 +3760,7 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 if tournament_type == 'team':
                     # Team tournament - не указываем сумму, показываем кнопку "Оплатить" с callback
                     msg = (
-                        "🎾 Ты записан на турнир!\n\n"
+                        "🎾 Вы записаны на турнир!\n\n"
                         f"🏷️ {title}\n"
                         f"📍 {location_str}\n"
                         f"🕒 {starts_at_str}\n"
@@ -3778,7 +3778,7 @@ async def process_new_entries(limit: int = Query(50, ge=1, le=500)):
                 else:
                     # Personal tournament - показываем сумму и кнопку "Оплатить" с callback
                     msg = (
-                        "🎾 Ты записан на турнир!\n\n"
+                        "🎾 Вы записаны на турнир!\n\n"
                         f"🏷️ {title}\n"
                         f"📍 {location_str}\n"
                         f"🕒 {starts_at_str}\n"
