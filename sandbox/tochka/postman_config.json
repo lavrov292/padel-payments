@@ -1,0 +1,53 @@
+{
+  "id": "1f6c8607-57ff-498b-99ab-ee5fae9209f2",
+  "name": "Sandbox",
+  "values": [
+    {
+      "key": "AS_URL",
+      "value": "https://enter.tochka.com",
+      "enabled": true,
+      "description": "Authorization Server URL"
+    },
+    {
+      "key": "RS_URL",
+      "value": "https://enter.tochka.com/sandbox/v2",
+      "enabled": true,
+      "description": "Resource Server URL (Sandbox)"
+    },
+    {
+      "key": "client_id",
+      "value": "test_app",
+      "enabled": true,
+      "description": "OAuth 2.0 Client ID для песочницы"
+    },
+    {
+      "key": "client_secret",
+      "value": "test_secret",
+      "enabled": true,
+      "description": "OAuth 2.0 Client Secret для песочницы"
+    },
+    {
+      "key": "accesstoken_hybrid",
+      "value": "sandbox.jwt.token",
+      "enabled": true,
+      "description": "Гибридный токен для песочницы (работает без OAuth)"
+    },
+    {
+      "key": "scope",
+      "value": "accounts balances customers statements sbp payments acquiring",
+      "enabled": true,
+      "description": "Разрешения для API"
+    },
+    {
+      "key": "accountId",
+      "value": "12345810901234567890/044525104",
+      "type": "default",
+      "enabled": true,
+      "description": "Тестовый accountId для запросов"
+    }
+  ],
+  "_source": "https://developers.tochka.com/assets/files/Sandbox.postman_environment-e02d431aa01391fe2f9a22e31b5306d6.json",
+  "_note": "Используйте эти настройки в скриптах для работы с песочницей"
+}
+
+

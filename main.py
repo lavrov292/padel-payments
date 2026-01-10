@@ -1833,6 +1833,12 @@ Username: {username_str}
                 cur.execute(query, (player_id,))
                 rows = cur.fetchall()
                 
+                # Debug: log query results
+                print(f"MY_TOURNAMENTS: player_id={player_id}, found {len(rows)} tournaments")
+                for row in rows:
+                    entry_id, title, starts_at, price_rub, tournament_type, location, payment_status = row
+                    print(f"  - entry_id={entry_id}, title={title}, starts_at={starts_at}, active=true, archived_at=NULL")
+                
                 cur.close()
                 conn.close()
                 
