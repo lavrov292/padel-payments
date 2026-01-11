@@ -138,11 +138,29 @@ export default function AdminPage() {
     
     // Filter by past
     if (!showPast) {
-      const tournamentDate = new Date(t.starts_at);
-      if (tournamentDate < now) {
+      // Если чекбокс не отмечен - скрываем прошедшие
+      if (!t.starts_at) {
+        return false; // Если нет даты, скрываем
+      }
+      try {
+        const tournamentDate = new Date(t.starts_at);
+        // Проверяем, что дата валидна
+        if (isNaN(tournamentDate.getTime())) {
+          console.warn('Invalid date:', t.starts_at);
+          return false;
+        }
+        // Сравниваем даты с учетом времени
+        const isPast = tournamentDate < now;
+        if (isPast) {
+          return false; // Скрываем прошедшие
+        }
+      } catch (e) {
+        // Если ошибка парсинга даты, скрываем
+        console.error('Error parsing date:', t.starts_at, e);
         return false;
       }
     }
+    // Если showPast = true, показываем все (и прошедшие, и будущие)
     
     return true;
   });
