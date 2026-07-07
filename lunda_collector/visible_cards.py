@@ -137,7 +137,7 @@ def _find_card_starts(lines: list[OCRLine]) -> list[int]:
     starts: list[int] = []
 
     for idx, line in enumerate(lines):
-        if _is_card_title_start(line.text):
+        if _is_card_title_start(line.text) and _looks_like_card_start(lines, idx):
             starts.append(idx)
             continue
 
@@ -148,7 +148,7 @@ def _find_card_starts(lines: list[OCRLine]) -> list[int]:
         for prev_idx in range(idx - 1, -1, -1):
             if line.y_min - lines[prev_idx].y_min > 260:
                 break
-            if _is_card_title_start(lines[prev_idx].text):
+            if _is_card_title_start(lines[prev_idx].text) and _looks_like_card_start(lines, prev_idx):
                 has_near_title = True
                 break
 
@@ -234,9 +234,10 @@ def _parse_card(lines: list[OCRLine]) -> dict[str, Any] | None:
             location_parts.append(text)
 
     title = _normalize_title(_join_wrapped(title_parts))
-    organizer = _join_wrapped(organizer_parts)
-    location = _join_wrapped(location_parts)
+    organizer = _normalize_organizer(_join_wrapped(organizer_parts))
+    location = _normalize_location(_join_wrapped(location_parts))
     location, category = _split_location_and_skill_level(location, category)
+    location = _normalize_location(location)
 
     if not title and not organizer:
         return None
@@ -367,6 +368,29 @@ def _is_card_title_start(text: str) -> bool:
     )
 
 
+def _looks_like_card_start(lines: list[OCRLine], start_idx: int) -> bool:
+    start_y = lines[start_idx].y_min
+    saw_organizer = False
+    saw_datetime = False
+
+    for idx in range(start_idx + 1, min(len(lines), start_idx + 12)):
+        line = lines[idx]
+        if line.y_min - start_y > 700:
+            break
+        if _is_bottom_nav(line.text):
+            break
+        if idx != start_idx + 1 and _is_card_title_start(line.text):
+            break
+        if _is_organizer_line(line.text):
+            saw_organizer = True
+        if _is_datetime_line(line.text):
+            saw_datetime = True
+        if saw_organizer and saw_datetime:
+            return True
+
+    return False
+
+
 def _is_organizer_line(text: str) -> bool:
     return text.lower().strip().startswith("организато")
 
@@ -425,6 +449,20 @@ def _normalize_title(title: str) -> str:
     if "«" in title and "»" not in title:
         title = f"{title}»"
     return title
+
+
+def _normalize_organizer(organizer: str) -> str:
+    organizer = re.sub(r"[©®™]", "", organizer)
+    return re.sub(r"\s+", " ", organizer).strip(" |,-")
+
+
+def _normalize_location(location: str) -> str:
+    text = re.sub(r"\bсанкт\s*[- ]\s*петербург\b", "", location, flags=re.IGNORECASE)
+    text = re.sub(r"\bсанкт\s*[- ]?\s*пет(?:ербур(?:г|.)?)?\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\|\s*(?=$)", "", text)
+    text = re.sub(r"^\s*\|\s*", "", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip(" |,-")
 
 
 def _normalize_price(text: str, match: re.Match[str]) -> str:
