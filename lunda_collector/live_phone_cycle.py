@@ -82,14 +82,15 @@ def main() -> int:
 
     schedule = subparsers.add_parser("schedule", help="Collect visible tournament schedule into DB")
     schedule.add_argument("--screens", type=int, default=30)
-    schedule.add_argument("--scroll-pixels", type=int, default=220)
+    schedule.add_argument("--scroll-pixels", type=int, default=440)
     schedule.add_argument("--days", type=int, default=21)
+    schedule.add_argument("--target-date", default="")
     schedule.add_argument("--launch", action="store_true")
     schedule.add_argument("--no-refresh", action="store_true")
 
     today = subparsers.add_parser("today-participants", help="Collect participants for target day tournaments")
     today.add_argument("--screens", type=int, default=40)
-    today.add_argument("--scroll-pixels", type=int, default=220)
+    today.add_argument("--scroll-pixels", type=int, default=440)
     today.add_argument("--participants-screens", type=int, default=10)
     today.add_argument("--participants-scroll-pixels", type=int, default=420)
     today.add_argument("--target-date", default="")
@@ -123,6 +124,7 @@ def main() -> int:
             screens=args.screens,
             scroll_pixels=args.scroll_pixels,
             days=args.days,
+            target_date=date.fromisoformat(args.target_date) if args.target_date else None,
             refresh=not args.no_refresh,
         )
     if args.command == "today-participants":
@@ -149,12 +151,14 @@ def collect_schedule(
     screens: int,
     scroll_pixels: int,
     days: int,
+    target_date: date | None,
     refresh: bool,
 ) -> int:
     run_id = start_run(conn, "schedule_live")
     stats = {"screens": 0, "observations": 0, "merged_cards": 0, "upserted": 0}
-    horizon = datetime.now(MSK).date() + timedelta(days=days)
+    horizon = target_date or (datetime.now(MSK).date() + timedelta(days=days))
     observations: list[dict[str, Any]] = []
+    consecutive_after_horizon = 0
     try:
         if not ensure_tournament_list(ctx, refresh=refresh):
             stats["error"] = "tournament_list_not_reached"
@@ -178,6 +182,19 @@ def collect_schedule(
             stats["screens"] += 1
             stats["observations"] += len(cards)
             print(f"Screen {screen_idx + 1}: cards={len(cards)}")
+
+            for card in cards:
+                parsed = parse_tournament_datetime(str(card.get("date", "")), str(card.get("time", "")))
+                if not parsed.tournament_date:
+                    continue
+                if parsed.tournament_date > horizon:
+                    consecutive_after_horizon += 1
+                else:
+                    consecutive_after_horizon = 0
+
+            if consecutive_after_horizon >= 3:
+                print(f"Next date confirmed after {horizon.isoformat()}: {consecutive_after_horizon} cards")
+                break
 
             merged_now = merge_visible_cards(observations)
             if _all_cards_after_horizon(merged_now, horizon):
@@ -524,11 +541,11 @@ def ensure_tournament_list(ctx: LiveContext, *, refresh: bool = False) -> bool:
         return reset_from_missing_tournament(ctx)
     if screen in {"participants", "tournament_detail"}:
         if not guarded_back_to_list(ctx):
-            return restart_lunda_to_tournament_list(ctx)
+            return recover_to_tournament_list(ctx)
         if refresh:
             return refresh_tournament_list(ctx)
         return True
-    return restart_lunda_to_tournament_list(ctx)
+    return recover_to_tournament_list(ctx)
 
 
 def expected_people_count(card: dict[str, Any]) -> int:
@@ -626,6 +643,14 @@ def restart_lunda_to_tournament_list(ctx: LiveContext) -> bool:
         hide_expanded_list_header(ctx)
         return True
     return False
+
+
+def recover_to_tournament_list(ctx: LiveContext) -> bool:
+    if refresh_tournament_list(ctx):
+        return True
+    if guarded_back_to_list(ctx, max_actions=6):
+        return refresh_tournament_list(ctx)
+    return restart_lunda_to_tournament_list(ctx)
 
 
 def tap_lunda_bottom_nav(ctx: LiveContext, button_name: str) -> bool:

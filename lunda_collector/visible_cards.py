@@ -41,7 +41,6 @@ REQUIRED_CARD_FIELDS = (
     "time",
     "location",
     "format",
-    "price",
     "participants",
 )
 
@@ -138,7 +137,7 @@ def _find_card_starts(lines: list[OCRLine]) -> list[int]:
     starts: list[int] = []
 
     for idx, line in enumerate(lines):
-        if _is_tournament_start(line.text):
+        if _is_card_title_start(line.text):
             starts.append(idx)
             continue
 
@@ -149,7 +148,7 @@ def _find_card_starts(lines: list[OCRLine]) -> list[int]:
         for prev_idx in range(idx - 1, -1, -1):
             if line.y_min - lines[prev_idx].y_min > 260:
                 break
-            if _is_tournament_start(lines[prev_idx].text):
+            if _is_card_title_start(lines[prev_idx].text):
                 has_near_title = True
                 break
 
@@ -212,13 +211,13 @@ def _parse_card(lines: list[OCRLine]) -> dict[str, Any] | None:
             continue
 
         if price_match:
-            price = f"{price_match.group(1).replace(' ', '')} ₽"
+            price = _normalize_price(text, price_match)
             tap_x = (line.x_min + line.x_max) // 2
             tap_y = (line.y_min + line.y_max) // 2
             continue
 
         if _is_category_line(text):
-            category = text
+            category = _normalize_skill_level(text)
             mode = "after_category"
             continue
 
@@ -234,9 +233,10 @@ def _parse_card(lines: list[OCRLine]) -> dict[str, Any] | None:
         elif mode == "location":
             location_parts.append(text)
 
-    title = _join_wrapped(title_parts)
+    title = _normalize_title(_join_wrapped(title_parts))
     organizer = _join_wrapped(organizer_parts)
     location = _join_wrapped(location_parts)
+    location, category = _split_location_and_skill_level(location, category)
 
     if not title and not organizer:
         return None
@@ -251,6 +251,7 @@ def _parse_card(lines: list[OCRLine]) -> dict[str, Any] | None:
         "time": time_value,
         "location": location,
         "skill_level": category,
+        "skill_levels": expand_skill_levels(category),
         "format": format_value,
         "price": price,
         "participants": participants,
@@ -298,6 +299,13 @@ def build_merge_key(card: dict[str, Any]) -> str:
     organizer = str(card.get("organizer", "")).strip()
     date_value = str(card.get("date", "")).strip()
     time_value = str(card.get("time", "")).strip()
+    location = str(card.get("location", "")).strip()
+    format_value = str(card.get("format", "")).strip()
+
+    secondary_fields = (date_value, time_value, location, format_value)
+    if all(secondary_fields):
+        return _normalize_key("|".join(["secondary", *secondary_fields]))
+
     if organizer and date_value and time_value:
         return _normalize_key("|".join([organizer, date_value, time_value]))
 
@@ -318,6 +326,13 @@ def _merge_card_into(existing: dict[str, Any], new_card: dict[str, Any]) -> None
     for field in REQUIRED_CARD_FIELDS:
         if not existing.get(field) and new_card.get(field):
             existing[field] = new_card[field]
+
+    for field in ("title", "organizer", "location", "skill_level", "format", "price"):
+        if _field_quality(new_card.get(field, "")) > _field_quality(existing.get(field, "")):
+            existing[field] = new_card[field]
+
+    if new_card.get("skill_levels") and not existing.get("skill_levels"):
+        existing["skill_levels"] = new_card["skill_levels"]
 
     for field in ("participants_current", "participants_capacity", "participants_unit"):
         if not existing.get(field) and new_card.get(field):
@@ -343,12 +358,12 @@ def _add_card_status(card: dict[str, Any]) -> None:
     card["is_complete"] = not missing_fields
 
 
-def _is_tournament_start(text: str) -> bool:
+def _is_card_title_start(text: str) -> bool:
     lower = text.lower().strip()
     return (
-        lower.startswith("турнир")
-        or lower.startswith("женский турнир")
-        or lower.startswith("мужской турнир")
+        (lower.startswith("турнир") and "«" in text)
+        or (lower.startswith("женский турнир") and "«" in text)
+        or (lower.startswith("мужской турнир") and "«" in text)
     )
 
 
@@ -371,8 +386,11 @@ def _split_datetime(text: str) -> tuple[str, str]:
 
 def _is_category_line(text: str) -> bool:
     normalized = text.strip()
+    compact = re.sub(r"\s+", "", normalized)
     return bool(
         re.fullmatch(r"[A-D][+-]?", normalized, re.IGNORECASE)
+        or re.fullmatch(r"([A-D][+-]?)\s+\1", normalized, re.IGNORECASE)
+        or re.fullmatch(r"[A-D][+-]?[A-D][+-]?", compact, re.IGNORECASE)
         or re.search(r"[A-D][+-]?\s*[.…]+\s*[A-D][+-]?", text, re.IGNORECASE)
         or re.search(r"[A-D][+-]?\s*[-–—]\s*[A-D][+-]?", text, re.IGNORECASE)
         or re.search(r"\(\d+[.,]\d+.*\d+[.,]\d+\)", text)
@@ -385,7 +403,9 @@ def _is_format_line(text: str) -> bool:
 
 
 def _price_match(text: str) -> re.Match[str] | None:
-    return re.search(r"(\d[\d\s]*)\s*(?:₽|р|руб)", text, re.IGNORECASE)
+    return re.search(r"(\d[\d\s]*)\s*(?:₽|р|руб)", text, re.IGNORECASE) or re.search(
+        r"^(0)\s*$|бесплат", text, re.IGNORECASE
+    )
 
 
 def _participants_match(text: str) -> re.Match[str] | None:
@@ -398,6 +418,95 @@ def _join_wrapped(parts: list[str]) -> str:
     text = re.sub(r"-\s+", "-", text)
     text = text.replace("« ", "«").replace(" »", "»")
     return text
+
+
+def _normalize_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", title).strip()
+    if "«" in title and "»" not in title:
+        title = f"{title}»"
+    return title
+
+
+def _normalize_price(text: str, match: re.Match[str]) -> str:
+    if re.search(r"бесплат", text, re.IGNORECASE):
+        return "0 ₽"
+    value = match.group(1) if match.lastindex else "0"
+    return f"{value.replace(' ', '')} ₽"
+
+
+def _normalize_skill_level(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*\([^)]*\)", "", text).strip()
+    repeated = re.fullmatch(r"([A-D][+-]?)\s+\1", text, re.IGNORECASE)
+    if repeated:
+        return repeated.group(1).upper()
+    compact_pair = re.fullmatch(r"([A-D][+-]?)([A-D][+-]?)", text.replace(" ", ""), re.IGNORECASE)
+    if compact_pair and compact_pair.group(1).upper() == compact_pair.group(2).upper():
+        return compact_pair.group(1).upper()
+    return text.upper().replace("..", "…")
+
+
+def _split_location_and_skill_level(location: str, skill_level: str) -> tuple[str, str]:
+    if not location:
+        return location, skill_level
+
+    pattern = re.compile(
+        r"^(?P<place>.+?)\s+(?P<level>(?:[A-D][+-]?\s+[A-D][+-]?|[A-D][+-]?\s*[.…-]+\s*[A-D][+-]?|[A-D][+-]?)(?:\s*\([^)]*\))?)$",
+        re.IGNORECASE,
+    )
+    match = pattern.match(location.strip())
+    if not match:
+        return location, skill_level
+
+    level = _normalize_skill_level(match.group("level"))
+    if not _is_category_line(level):
+        return location, skill_level
+    place = match.group("place").strip()
+    return place, skill_level or level
+
+
+LEVEL_ORDER = ["D", "D+", "C", "C+", "B", "B+", "A"]
+
+
+def expand_skill_levels(skill_level: str) -> list[str]:
+    if not skill_level:
+        return []
+    cleaned = _normalize_skill_level(skill_level)
+    tokens = re.findall(r"[A-D][+]?", cleaned, re.IGNORECASE)
+    tokens = [token.upper() for token in tokens]
+    if not tokens:
+        return []
+    if len(tokens) == 1:
+        return tokens
+    first = tokens[0]
+    last = tokens[-1]
+    if first in LEVEL_ORDER and last in LEVEL_ORDER:
+        start = LEVEL_ORDER.index(first)
+        end = LEVEL_ORDER.index(last)
+        if start <= end:
+            return LEVEL_ORDER[start : end + 1]
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def _field_quality(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    score = len(text)
+    if "«" in text and "»" in text:
+        score += 100
+    if re.fullmatch(r"турнир[»\"]?", text, re.IGNORECASE):
+        score -= 100
+    if any(char.isdigit() for char in text):
+        score += 5
+    return score
 
 
 def _normalize_key(text: str) -> str:
