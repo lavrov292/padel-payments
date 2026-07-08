@@ -159,6 +159,7 @@ def collect_schedule(
     horizon = target_date or (datetime.now(MSK).date() + timedelta(days=days))
     observations: list[dict[str, Any]] = []
     consecutive_after_horizon = 0
+    consecutive_unknown_screens = 0
     try:
         if not ensure_tournament_list(ctx, refresh=refresh):
             stats["error"] = "tournament_list_not_reached"
@@ -171,8 +172,15 @@ def collect_schedule(
             ocr_result, text, _ = captured
             screen = detect_screen(text)
             if screen != "tournament_list":
+                if screen == "unknown" and consecutive_unknown_screens < 2:
+                    consecutive_unknown_screens += 1
+                    print(f"Screen {screen_idx + 1}: screen=unknown, skipping")
+                    ctx.android.scroll_down(pixels=scroll_pixels)
+                    time.sleep(1.2)
+                    continue
                 print(f"Screen {screen_idx + 1}: screen={screen}, stopping")
                 break
+            consecutive_unknown_screens = 0
 
             cards = parse_visible_tournament_cards(ocr_result)
             list_stale = False
