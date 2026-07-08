@@ -13,7 +13,12 @@ from typing import Any
 
 from date_parser import MSK, participant_target_date, parse_tournament_datetime
 from device_backend import ADBDevice, YandexOCRClient
-from participants_parser import is_departed_section, is_departed_status, parse_participants_from_ocr
+from participants_parser import (
+    append_unique_participant,
+    is_departed_section,
+    is_departed_status,
+    parse_participants_from_ocr,
+)
 from screen_nav import (
     detect_screen,
     find_home_button_center,
@@ -430,8 +435,7 @@ def scan_open_participants(
         found = parse_participants_from_ocr(ocr_result, tournament_type=tournament_type)
         before = len(participants)
         for participant in found:
-            if participant not in participants:
-                participants.append(participant)
+            append_unique_participant(participants, participant)
         added = len(participants) - before
         print(f"Participants screen {screen_idx + 1}: found={len(found)} added={added} total={len(participants)}")
 

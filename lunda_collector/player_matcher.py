@@ -214,6 +214,8 @@ def passes_similarity_filter(
             return True, surname_dist, name_dist
         if _one_letter_surname_shift(input_surname, candidate_surname) and (name_dist is None or name_dist <= 1):
             return True, surname_dist, name_dist
+        if input_surname and input_name and candidate_surname and candidate_name:
+            return False, surname_dist, name_dist
         return True, surname_dist, name_dist
 
     if full_dist <= max_dist + 2:

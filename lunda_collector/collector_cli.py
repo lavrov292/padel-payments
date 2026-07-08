@@ -11,7 +11,12 @@ from typing import Any
 from date_parser import MSK
 from exports import export_workbook
 from player_matcher import normalize_name
-from participants_parser import is_departed_section, is_departed_status, parse_participants_from_ocr
+from participants_parser import (
+    append_unique_participant,
+    is_departed_section,
+    is_departed_status,
+    parse_participants_from_ocr,
+)
 from storage import (
     DEFAULT_DB_PATH,
     connect,
@@ -315,8 +320,7 @@ def _load_participants_from_ocr_dir(path: Path, *, tournament_type: str = "auto"
 
         found = parse_participants_from_ocr(ocr_result, tournament_type=tournament_type)
         for participant in found:
-            if participant not in participants:
-                participants.append(participant)
+            append_unique_participant(participants, participant)
 
         if departed_marker_seen:
             break

@@ -65,7 +65,7 @@ def parse_participants_from_ocr(ocr_result: dict[str, Any], tournament_type: str
     if header_y is None:
         return []
 
-    return _parse_participant_lines(lines, header_y)
+    return _parse_participant_rows(extract_words(ocr_result), header_y) or _parse_participant_lines(lines, header_y)
 
 
 def extract_words(ocr_result: dict[str, Any]) -> list[OCRWord]:
@@ -178,6 +178,64 @@ def _parse_participant_lines(lines, header_y: int) -> list[str]:
     return participants
 
 
+def _parse_participant_rows(words: list[OCRWord], header_y: int) -> list[str]:
+    candidates: list[dict[str, Any]] = []
+    participants: list[str] = []
+
+    for row in _group_words_into_rows(words):
+        if not row:
+            continue
+        y_min = min(word.y_min for word in row)
+        y_max = max(word.y_max for word in row)
+        if y_min <= header_y + 20:
+            continue
+
+        row_text = _participant_row_text(row)
+        if is_departed_section(row_text):
+            break
+
+        candidate = _line_to_name_candidate(row_text)
+        if not candidate:
+            continue
+        tokens = candidate.split()
+        if len(tokens) == 1 and y_min <= header_y + 100:
+            continue
+
+        candidates.append(
+            {
+                "name": candidate,
+                "tokens": tokens,
+                "y_min": y_min,
+                "y_max": y_max,
+                "x_min": min(word.x_min for word in row),
+            }
+        )
+
+    idx = 0
+    while idx < len(candidates):
+        current = candidates[idx]
+        current_tokens = current["tokens"]
+
+        if len(current_tokens) >= 2:
+            _append_unique(participants, current["name"])
+            idx += 1
+            continue
+
+        if idx + 1 < len(candidates):
+            next_item = candidates[idx + 1]
+            next_tokens = next_item["tokens"]
+            y_gap = next_item["y_min"] - current["y_max"]
+            if len(next_tokens) == 1 and 0 <= y_gap <= 95:
+                _append_unique(participants, f"{current['name']} {next_item['name']}")
+                idx += 2
+                continue
+
+        _append_unique(participants, current["name"])
+        idx += 1
+
+    return participants
+
+
 def is_departed_section(text: str) -> bool:
     lower = text.lower()
     return "покинувш" in lower or ("игроки" in lower and "покин" in lower)
@@ -199,6 +257,8 @@ def _line_to_name_candidate(text: str) -> str:
         return ""
 
     words = [word for word in re.findall(r"[A-Za-zА-Яа-яЁё-]+", text) if _is_name_word(word)]
+    if len(words) > 1:
+        words = [word for word in words if not _looks_like_multi_letter_avatar_initials(word)]
     if not words:
         return ""
 
@@ -211,9 +271,21 @@ def _line_to_name_candidate(text: str) -> str:
 
 
 def _append_unique(participants: list[str], name: str) -> None:
+    append_unique_participant(participants, name)
+
+
+def append_unique_participant(participants: list[str], name: str) -> None:
     normalized = " ".join(name.split())
-    if normalized and normalized not in participants:
-        participants.append(normalized)
+    if not normalized:
+        return
+
+    for idx, existing in enumerate(participants):
+        if _same_participant_name(existing, normalized):
+            if _participant_name_quality(normalized) > _participant_name_quality(existing):
+                participants[idx] = normalized
+            return
+
+    participants.append(normalized)
 
 
 def _group_words_into_rows(words: list[OCRWord]) -> list[list[OCRWord]]:
@@ -230,6 +302,15 @@ def _group_words_into_rows(words: list[OCRWord]) -> list[list[OCRWord]]:
 
 def _row_y_center(row: list[OCRWord]) -> int:
     return sum(word.y_center for word in row) // len(row)
+
+
+def _participant_row_text(row: list[OCRWord]) -> str:
+    useful_words = [
+        word.text
+        for word in row
+        if not (word.x_max < 170 and _looks_like_left_avatar_badge(word.text))
+    ]
+    return " ".join(useful_words)
 
 
 def _is_name_word(text: str) -> bool:
@@ -253,3 +334,65 @@ def _looks_like_avatar_initials(text: str) -> bool:
     if not token.isupper():
         return False
     return bool(re.fullmatch(r"[A-ZА-ЯЁ]{1,3}", token))
+
+
+def _looks_like_multi_letter_avatar_initials(text: str) -> bool:
+    token = text.strip(".,:;!?()[]{}«»\"'")
+    return len(token) >= 2 and _looks_like_avatar_initials(token)
+
+
+def _looks_like_left_avatar_badge(text: str) -> bool:
+    token = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", text.strip())
+    if not token or len(token) > 3:
+        return False
+    return token.isupper()
+
+
+def _same_participant_name(left: str, right: str) -> bool:
+    left_key = _participant_compare_key(left)
+    right_key = _participant_compare_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+
+    left_parts = left_key.split()
+    right_parts = right_key.split()
+    if len(left_parts) < 2 or len(right_parts) < 2:
+        return False
+
+    surname_dist = _levenshtein_distance(left_parts[0], right_parts[0])
+    name_dist = _levenshtein_distance(left_parts[1], right_parts[1])
+    return surname_dist <= 1 and name_dist <= 1
+
+
+def _participant_name_quality(name: str) -> int:
+    key = _participant_compare_key(name)
+    score = len(key)
+    if len(key.split()) >= 2:
+        score += 20
+    return score
+
+
+def _participant_compare_key(name: str) -> str:
+    text = name.lower().replace("ё", "е")
+    text = text.replace("і", "и").replace("ї", "и")
+    text = re.sub(r"[^a-zа-я\\s-]", " ", text, flags=re.IGNORECASE)
+    text = text.replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    if len(left) < len(right):
+        left, right = right, left
+
+    previous_row = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, 1):
+        current_row = [i]
+        for j, right_char in enumerate(right, 1):
+            insertions = previous_row[j] + 1
+            deletions = current_row[j - 1] + 1
+            substitutions = previous_row[j - 1] + (left_char != right_char)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
