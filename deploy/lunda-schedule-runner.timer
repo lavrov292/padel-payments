@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Lunda future schedule collector nightly
+
+[Timer]
+OnCalendar=*-*-* 19:30:00
+Persistent=true
+Unit=lunda-schedule-runner.service
+
+[Install]
+WantedBy=timers.target
