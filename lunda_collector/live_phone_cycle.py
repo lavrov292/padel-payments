@@ -103,6 +103,8 @@ def main() -> int:
     today.add_argument("--no-refresh", action="store_true")
     today.add_argument("--finalize-grace-minutes", type=int, default=0)
     today.add_argument("--max-tournaments", type=int, default=0)
+    today.add_argument("--lookahead-minutes", type=int, default=0)
+    today.add_argument("--window-start-minutes", type=int, default=0)
 
     args = parser.parse_args()
     selected_device = args.device or select_adb_device()
@@ -145,6 +147,8 @@ def main() -> int:
             participants_scroll_pixels=args.participants_scroll_pixels,
             finalize_grace_minutes=args.finalize_grace_minutes,
             max_tournaments=args.max_tournaments,
+            lookahead_minutes=args.lookahead_minutes,
+            window_start_minutes=args.window_start_minutes,
             refresh=not args.no_refresh,
         )
 
@@ -255,13 +259,20 @@ def collect_today_participants(
     participants_scroll_pixels: int,
     finalize_grace_minutes: int,
     max_tournaments: int,
+    lookahead_minutes: int,
+    window_start_minutes: int,
     refresh: bool,
 ) -> int:
     run_id = start_run(conn, "today_participants_live")
+    window_start = datetime.now(MSK) + timedelta(minutes=window_start_minutes)
+    window_end = window_start + timedelta(minutes=lookahead_minutes) if lookahead_minutes > 0 else None
     stats = {
         "target_date": target_date.isoformat(),
+        "window_start": window_start.isoformat(timespec="seconds"),
+        "window_end": window_end.isoformat(timespec="seconds") if window_end else "",
         "screens": 0,
         "cards_seen": 0,
+        "cards_in_window": 0,
         "tournaments_opened": 0,
         "cancelled": 0,
         "missing": 0,
@@ -269,6 +280,7 @@ def collect_today_participants(
         "participants_seen": 0,
     }
     processed_keys: set[str] = set()
+    consecutive_after_window = 0
 
     try:
         finalize_stats = finalize_due_tournaments(conn, grace_minutes=finalize_grace_minutes)
@@ -301,6 +313,14 @@ def collect_today_participants(
                 parsed = parse_tournament_datetime(str(card.get("date", "")), str(card.get("time", "")))
                 if parsed.tournament_date != target_date:
                     continue
+                if window_end and parsed.starts_at:
+                    if parsed.starts_at < window_start:
+                        continue
+                    if parsed.starts_at > window_end:
+                        consecutive_after_window += 1
+                        continue
+                    consecutive_after_window = 0
+                    stats["cards_in_window"] += 1
                 if not _card_is_safe_to_open(card):
                     continue
                 tournament_key = "|".join(str(card.get(field, "")) for field in ("organizer", "date", "time", "title"))
@@ -330,6 +350,10 @@ def collect_today_participants(
                         print(json.dumps(stats, ensure_ascii=False, indent=2))
                         print(f"Artifacts: {ctx.out_dir}")
                         return 0
+
+            if window_end and consecutive_after_window >= 3:
+                print(f"Window end reached after {window_end.isoformat(timespec='seconds')}: {consecutive_after_window} cards")
+                break
 
             if list_stale:
                 continue
