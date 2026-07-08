@@ -1,0 +1,10 @@
+[Unit]
+Description=Start Lunda participant collector every morning
+
+[Timer]
+OnCalendar=*-*-* 02:55:00
+Persistent=true
+Unit=lunda-participant-runner.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Lunda stats web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lunda-collector/app/lunda_collector
+Environment=LUNDA_DB_PATH=/opt/lunda-collector/work/lunda_live/participant_window.sqlite3
+ExecStart=/opt/lunda-collector/app/.venv/bin/uvicorn web_api:app --host 0.0.0.0 --port 8008
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/lunda-collector/work/lunda_web.systemd.log
+StandardError=append:/opt/lunda-collector/work/lunda_web.systemd.log
+
+[Install]
+WantedBy=multi-user.target

@@ -28,7 +28,9 @@ async def optional_basic_auth(request, call_next):
     user = os.environ.get("LUNDA_WEB_USER")
     password = os.environ.get("LUNDA_WEB_PASSWORD")
     if not user and not password:
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     header = request.headers.get("authorization", "")
     expected = f"{user}:{password}"
@@ -47,7 +49,9 @@ async def optional_basic_auth(request, call_next):
             headers={"WWW-Authenticate": 'Basic realm="Lunda Stats"'},
         )
 
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def db_path() -> Path:

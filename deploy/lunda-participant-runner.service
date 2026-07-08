@@ -1,0 +1,16 @@
+[Unit]
+Description=Lunda participant collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lunda-collector/app/lunda_collector
+Environment=LUNDA_DB_PATH=/opt/lunda-collector/work/lunda_live/participant_window.sqlite3
+ExecStart=/opt/lunda-collector/app/.venv/bin/python -u /opt/lunda-collector/app/lunda_collector/participant_window_runner.py --db /opt/lunda-collector/work/lunda_live/participant_window.sqlite3 --device 100.77.174.30:5555 --interval-minutes 30 --lookahead-minutes 150 --active-from 06:00 --active-until 22:00 --cycle-timeout-minutes 29 --screens 16 --scroll-pixels 440 --participants-screens 10 --participants-scroll-pixels 420 --launch --exit-after-active-until
+Restart=no
+StandardOutput=append:/opt/lunda-collector/work/lunda_participant_runner.systemd.log
+StandardError=append:/opt/lunda-collector/work/lunda_participant_runner.systemd.log
+
+[Install]
+WantedBy=multi-user.target
