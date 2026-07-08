@@ -93,6 +93,36 @@ def resolve_player(
     close_candidates = [candidate for candidate in candidates if candidate.dist <= threshold]
 
     if close_candidates:
+        if _raw_variant_wins_tournament_consensus(
+            conn,
+            normalized_name=normalized,
+            candidate=close_candidates[0],
+            tournament_id=tournament_id,
+        ):
+            player_id = _create_player(conn, raw_name, normalized, now_iso)
+            return PlayerResolution(player_id, "new_player", normalized, close_candidates)
+
+        auto_candidate = _auto_resolve_close_candidate(
+            conn,
+            normalized_name=normalized,
+            candidates=close_candidates,
+            tournament_id=tournament_id,
+        )
+        if auto_candidate:
+            _touch_player(conn, auto_candidate.player_id, now_iso)
+            _mark_pending_auto_resolved(
+                conn,
+                normalized_name=normalized,
+                tournament_id=tournament_id,
+                player_id=auto_candidate.player_id,
+            )
+            return PlayerResolution(
+                auto_candidate.player_id,
+                "fuzzy_auto_existing",
+                normalized,
+                close_candidates,
+            )
+
         _upsert_pending_player(
             conn,
             raw_name=raw_name,
@@ -330,6 +360,155 @@ def _upsert_pending_player(
         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
         """,
         (run_id, tournament_id, raw_name.strip(), normalized_name, candidates_json, now_iso, now_iso),
+    )
+
+
+def _auto_resolve_close_candidate(
+    conn: sqlite3.Connection,
+    *,
+    normalized_name: str,
+    candidates: list[Candidate],
+    tournament_id: int | None,
+) -> Candidate | None:
+    if not candidates:
+        return None
+
+    best = candidates[0]
+    if tournament_id:
+        raw_tournament_count = _snapshot_variant_count(conn, tournament_id, normalized_name)
+        best_tournament_count = _snapshot_variant_count(conn, tournament_id, best.normalized_name)
+        if best_tournament_count > raw_tournament_count:
+            return best
+        if raw_tournament_count > best_tournament_count:
+            return None
+        if best_tournament_count > 0 and best.dist <= 1 and _player_observation_count(conn, best.player_id) > 1:
+            return best
+
+    raw_count = _normalized_name_observation_count(conn, normalized_name)
+    best_count = _player_observation_count(conn, best.player_id)
+    if best.dist <= 1 and best_count > raw_count:
+        return best
+
+    if best.dist <= 1 and raw_count == 0 and _candidate_is_unambiguous(best, candidates):
+        return best
+
+    return None
+
+
+def _raw_variant_wins_tournament_consensus(
+    conn: sqlite3.Connection,
+    *,
+    normalized_name: str,
+    candidate: Candidate,
+    tournament_id: int | None,
+) -> bool:
+    if not tournament_id:
+        return False
+    raw_tournament_count = _snapshot_variant_count(conn, tournament_id, normalized_name)
+    candidate_tournament_count = _snapshot_variant_count(conn, tournament_id, candidate.normalized_name)
+    return raw_tournament_count > candidate_tournament_count
+
+
+def _candidate_is_unambiguous(best: Candidate, candidates: list[Candidate]) -> bool:
+    if len(candidates) == 1:
+        return True
+    second = candidates[1]
+    return best.dist < second.dist or best.score + 10 < second.score
+
+
+def _candidate_seen_in_tournament(conn: sqlite3.Connection, player_id: int, tournament_id: int) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM current_participants
+        WHERE tournament_id = ? AND player_id = ?
+        LIMIT 1
+        """,
+        (tournament_id, player_id),
+    ).fetchone()
+    if row:
+        return True
+
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM final_participations
+        WHERE tournament_id = ? AND player_id = ?
+        LIMIT 1
+        """,
+        (tournament_id, player_id),
+    ).fetchone()
+    return bool(row)
+
+
+def _snapshot_variant_count(conn: sqlite3.Connection, tournament_id: int, normalized_name: str) -> int:
+    import json
+
+    count = 0
+    rows = conn.execute(
+        """
+        SELECT participants_json
+        FROM participant_snapshots
+        WHERE tournament_id = ?
+        """,
+        (tournament_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            values = json.loads(row["participants_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for value in values:
+            if normalize_name(str(value)) == normalized_name:
+                count += 1
+    return count
+
+
+def _normalized_name_observation_count(conn: sqlite3.Connection, normalized_name: str) -> int:
+    current_count = conn.execute(
+        "SELECT COUNT(*) FROM current_participants WHERE normalized_name = ?",
+        (normalized_name,),
+    ).fetchone()[0]
+    final_count = conn.execute(
+        "SELECT COUNT(*) FROM final_participations WHERE normalized_name = ?",
+        (normalized_name,),
+    ).fetchone()[0]
+    pending_count = conn.execute(
+        "SELECT COUNT(*) FROM pending_players WHERE normalized_name = ?",
+        (normalized_name,),
+    ).fetchone()[0]
+    return int(current_count) + int(final_count) + int(pending_count)
+
+
+def _player_observation_count(conn: sqlite3.Connection, player_id: int) -> int:
+    current_count = conn.execute(
+        "SELECT COUNT(*) FROM current_participants WHERE player_id = ?",
+        (player_id,),
+    ).fetchone()[0]
+    final_count = conn.execute(
+        "SELECT COUNT(*) FROM final_participations WHERE player_id = ?",
+        (player_id,),
+    ).fetchone()[0]
+    return int(current_count) + int(final_count)
+
+
+def _mark_pending_auto_resolved(
+    conn: sqlite3.Connection,
+    *,
+    normalized_name: str,
+    tournament_id: int | None,
+    player_id: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE pending_players
+        SET status = 'auto_resolved',
+            resolved_player_id = ?
+        WHERE normalized_name = ?
+          AND COALESCE(tournament_id, 0) = COALESCE(?, 0)
+          AND status = 'pending'
+        """,
+        (player_id, normalized_name, tournament_id),
     )
 
 
