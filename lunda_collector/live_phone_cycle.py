@@ -97,6 +97,7 @@ def main() -> int:
     today.add_argument("--launch", action="store_true")
     today.add_argument("--no-refresh", action="store_true")
     today.add_argument("--finalize-grace-minutes", type=int, default=0)
+    today.add_argument("--max-tournaments", type=int, default=0)
 
     args = parser.parse_args()
     selected_device = args.device or select_adb_device()
@@ -138,6 +139,7 @@ def main() -> int:
             participants_screens=args.participants_screens,
             participants_scroll_pixels=args.participants_scroll_pixels,
             finalize_grace_minutes=args.finalize_grace_minutes,
+            max_tournaments=args.max_tournaments,
             refresh=not args.no_refresh,
         )
 
@@ -247,6 +249,7 @@ def collect_today_participants(
     participants_screens: int,
     participants_scroll_pixels: int,
     finalize_grace_minutes: int,
+    max_tournaments: int,
     refresh: bool,
 ) -> int:
     run_id = start_run(conn, "today_participants_live")
@@ -316,6 +319,12 @@ def collect_today_participants(
                     break
                 if open_result:
                     ensure_tournament_list(ctx)
+                    if max_tournaments and stats["tournaments_opened"] >= max_tournaments:
+                        print(f"Max tournaments reached: {max_tournaments}")
+                        finish_run(conn, run_id, stats=stats)
+                        print(json.dumps(stats, ensure_ascii=False, indent=2))
+                        print(f"Artifacts: {ctx.out_dir}")
+                        return 0
 
             if list_stale:
                 continue
@@ -439,7 +448,7 @@ def scan_open_participants(
     return participants
 
 
-def open_participants_section(ctx: LiveContext, *, max_scrolls: int = 6) -> bool:
+def open_participants_section(ctx: LiveContext, *, max_scrolls: int = 12) -> bool:
     for attempt in range(max_scrolls + 1):
         captured = ctx.capture(f"open_participants_{attempt + 1}")
         if not captured:

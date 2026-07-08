@@ -66,7 +66,7 @@ def find_first_line_center(
 def find_participants_entry_center(ocr_result: dict[str, Any]) -> dict[str, int] | None:
     def is_entry(line: OCRLine) -> bool:
         lower = line.text.lower().strip()
-        return lower == "команды" or lower.startswith("участники")
+        return lower in {"команды", "участники"}
 
     return find_first_line_center(ocr_result, is_entry)
 
