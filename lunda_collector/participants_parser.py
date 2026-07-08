@@ -257,8 +257,7 @@ def _line_to_name_candidate(text: str) -> str:
         return ""
 
     words = [word for word in re.findall(r"[A-Za-zА-Яа-яЁё-]+", text) if _is_name_word(word)]
-    if len(words) > 1:
-        words = [word for word in words if not _looks_like_multi_letter_avatar_initials(word)]
+    words = _strip_leading_avatar_initials(words)
     if not words:
         return ""
 
@@ -348,6 +347,13 @@ def _looks_like_left_avatar_badge(text: str) -> bool:
     return token.isupper()
 
 
+def _strip_leading_avatar_initials(words: list[str]) -> list[str]:
+    result = list(words)
+    while len(result) > 2 and _looks_like_multi_letter_avatar_initials(result[0]):
+        result.pop(0)
+    return result
+
+
 def _same_participant_name(left: str, right: str) -> bool:
     left_key = _participant_compare_key(left)
     right_key = _participant_compare_key(right)
@@ -361,9 +367,18 @@ def _same_participant_name(left: str, right: str) -> bool:
     if len(left_parts) < 2 or len(right_parts) < 2:
         return False
 
+    left_name = "".join(left_parts[1:])
+    right_name = "".join(right_parts[1:])
     surname_dist = _levenshtein_distance(left_parts[0], right_parts[0])
-    name_dist = _levenshtein_distance(left_parts[1], right_parts[1])
-    return surname_dist <= 1 and name_dist <= 1
+    name_dist = _levenshtein_distance(left_name, right_name)
+    if surname_dist <= 1 and name_dist <= 1:
+        return True
+
+    if surname_dist == 0:
+        longer_name_len = max(len(left_parts[1]), len(right_parts[1]))
+        return longer_name_len >= 7 and name_dist <= 4
+
+    return False
 
 
 def _participant_name_quality(name: str) -> int:
@@ -371,7 +386,13 @@ def _participant_name_quality(name: str) -> int:
     score = len(key)
     if len(key.split()) >= 2:
         score += 20
+    if _has_suspicious_latin_sequence(key):
+        score -= 10
     return score
+
+
+def _has_suspicious_latin_sequence(key: str) -> bool:
+    return bool(re.search(r"[a-z]*q[a-z]*", key))
 
 
 def _participant_compare_key(name: str) -> str:
