@@ -40,6 +40,7 @@ REQUIRED_CARD_FIELDS = (
     "date",
     "time",
     "location",
+    "skill_level",
     "format",
     "participants",
 )
@@ -332,8 +333,7 @@ def _merge_card_into(existing: dict[str, Any], new_card: dict[str, Any]) -> None
         if _field_quality(new_card.get(field, "")) > _field_quality(existing.get(field, "")):
             existing[field] = new_card[field]
 
-    if new_card.get("skill_levels") and not existing.get("skill_levels"):
-        existing["skill_levels"] = new_card["skill_levels"]
+    existing["skill_levels"] = expand_skill_levels(str(existing.get("skill_level", "")))
 
     for field in ("participants_current", "participants_capacity", "participants_unit"):
         if not existing.get(field) and new_card.get(field):
