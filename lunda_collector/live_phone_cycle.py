@@ -171,6 +171,8 @@ def collect_schedule(
     observations: list[dict[str, Any]] = []
     consecutive_after_horizon = 0
     consecutive_unknown_screens = 0
+    previous_signature = ""
+    repeated_signature_count = 0
     try:
         if not ensure_tournament_list(ctx, refresh=refresh):
             stats["error"] = "tournament_list_not_reached"
@@ -186,7 +188,7 @@ def collect_schedule(
                 if screen == "unknown" and consecutive_unknown_screens < 2:
                     consecutive_unknown_screens += 1
                     print(f"Screen {screen_idx + 1}: screen=unknown, skipping")
-                    ctx.android.scroll_down(pixels=scroll_pixels)
+                    scroll_tournament_list(ctx)
                     time.sleep(1.2)
                     continue
                 print(f"Screen {screen_idx + 1}: screen={screen}, stopping")
@@ -194,6 +196,18 @@ def collect_schedule(
             consecutive_unknown_screens = 0
 
             cards = parse_visible_tournament_cards(ocr_result)
+            signature = cards_signature(cards)
+            if signature and signature == previous_signature:
+                repeated_signature_count += 1
+            else:
+                repeated_signature_count = 0
+                previous_signature = signature
+            if repeated_signature_count >= 4:
+                stats["error"] = "tournament_list_did_not_scroll"
+                finish_run(conn, run_id, status="error", stats=stats, error="tournament_list_did_not_scroll")
+                print("Tournament list did not scroll for 4 consecutive OCR screens; stopping")
+                return 4
+
             list_stale = False
             for card in cards:
                 card["screen_index"] = screen_idx + 1
@@ -220,7 +234,7 @@ def collect_schedule(
                 print(f"Horizon reached: {horizon.isoformat()}")
                 break
 
-            ctx.android.scroll_down(pixels=scroll_pixels)
+            scroll_tournament_list(ctx)
             time.sleep(1.2)
 
         merged = merge_visible_cards(observations)
@@ -246,6 +260,50 @@ def collect_schedule(
     print(f"Upserted: {stats['upserted']}")
     print(f"Artifacts: {ctx.out_dir}")
     return 0
+
+
+def cards_signature(cards: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for card in cards[:3]:
+        values = [
+            str(card.get("title", "")),
+            str(card.get("organizer", "")),
+            str(card.get("date", "")),
+            str(card.get("time", "")),
+            str(card.get("location", "")),
+        ]
+        parts.append("|".join(value.lower().strip() for value in values))
+    return "||".join(parts)
+
+
+def scroll_tournament_list(ctx: LiveContext) -> bool:
+    width, height = get_screen_size(ctx)
+    x = width // 2
+    start_y = int(height * 0.76)
+    end_y = int(height * 0.23)
+    adb_path = getattr(ctx.android, "adb_path", "adb")
+    device_id = getattr(ctx.android, "device_id", "") or select_adb_device()
+    result = subprocess.run(
+        [
+            adb_path,
+            "-s",
+            device_id,
+            "shell",
+            "input",
+            "swipe",
+            str(x),
+            str(start_y),
+            str(x),
+            str(end_y),
+            "600",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=8,
+    )
+    time.sleep(0.5)
+    return result.returncode == 0
 
 
 def collect_today_participants(

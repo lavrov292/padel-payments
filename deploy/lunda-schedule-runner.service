@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/opt/lunda-collector/app/lunda_collector
 Environment=LUNDA_DB_PATH=/opt/lunda-collector/work/lunda_live/participant_window.sqlite3
-ExecStart=/opt/lunda-collector/app/.venv/bin/python -u /opt/lunda-collector/app/lunda_collector/schedule_runner.py --db /opt/lunda-collector/work/lunda_live/participant_window.sqlite3 --device 100.77.174.30:5555 --days 21 --screens 80 --scroll-pixels 880 --cycle-timeout-minutes 90 --launch
-TimeoutStartSec=7200
+ExecStart=/opt/lunda-collector/app/.venv/bin/python -u /opt/lunda-collector/app/lunda_collector/schedule_runner.py --db /opt/lunda-collector/work/lunda_live/participant_window.sqlite3 --device 100.77.174.30:5555 --days 21 --screens 450 --scroll-pixels 880 --cycle-timeout-minutes 240 --launch
+TimeoutStartSec=18000
 StandardOutput=append:/opt/lunda-collector/work/lunda_schedule_runner.systemd.log
 StandardError=append:/opt/lunda-collector/work/lunda_schedule_runner.systemd.log
 

@@ -52,7 +52,7 @@ class ADBDevice:
             start_y = height // 2 - abs_pixels // 2
             end_y = start_y + abs_pixels
         result = self._run(
-            ["shell", "input", "swipe", str(start_x), str(start_y), str(start_x), str(end_y), "300"],
+            ["shell", "input", "swipe", str(start_x), str(start_y), str(start_x), str(end_y), "600"],
             device=self._target_device(),
             timeout=8,
         )
