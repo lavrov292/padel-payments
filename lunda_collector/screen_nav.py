@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+import re
 
 from participants_parser import is_departed_section, is_departed_status
 from visible_cards import OCRLine, extract_ocr_lines
@@ -22,6 +23,9 @@ def detect_screen(text: str) -> str:
         return "tournament_list"
 
     if has_bottom_nav and "турнир" in lower and "организатор" in lower:
+        return "tournament_list"
+
+    if has_bottom_nav and re.search(r"\b(?:пн|вт|ср|чт|пт|сб|вс)\s+\d{1,2}\s+[а-яё]+", lower) and re.search(r"\d{1,2}:\d{2}", lower):
         return "tournament_list"
 
     if has_bottom_nav and ("ваш город" in lower or "календарь" in lower or "приглашения" in lower):

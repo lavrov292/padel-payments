@@ -207,6 +207,10 @@ def collect_schedule(
         merged = merge_visible_cards(observations)
         stats["merged_cards"] = len(merged)
         for card in merged:
+            if target_date:
+                parsed = parse_tournament_datetime(str(card.get("date", "")), str(card.get("time", "")))
+                if parsed.tournament_date != target_date:
+                    continue
             if not is_persistable_tournament_card(card):
                 continue
             upsert_tournament_from_card(conn, card, run_id=run_id, source="live_schedule")

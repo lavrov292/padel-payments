@@ -137,7 +137,7 @@ def _find_card_starts(lines: list[OCRLine]) -> list[int]:
     starts: list[int] = []
 
     for idx, line in enumerate(lines):
-        if _is_card_title_start(line.text) and _looks_like_card_start(lines, idx):
+        if _is_card_title_start(line.text):
             starts.append(idx)
             continue
 
@@ -148,7 +148,7 @@ def _find_card_starts(lines: list[OCRLine]) -> list[int]:
         for prev_idx in range(idx - 1, -1, -1):
             if line.y_min - lines[prev_idx].y_min > 260:
                 break
-            if _is_card_title_start(lines[prev_idx].text) and _looks_like_card_start(lines, prev_idx):
+            if _is_card_title_start(lines[prev_idx].text):
                 has_near_title = True
                 break
 
@@ -368,29 +368,6 @@ def _is_card_title_start(text: str) -> bool:
     )
 
 
-def _looks_like_card_start(lines: list[OCRLine], start_idx: int) -> bool:
-    start_y = lines[start_idx].y_min
-    saw_organizer = False
-    saw_datetime = False
-
-    for idx in range(start_idx + 1, min(len(lines), start_idx + 12)):
-        line = lines[idx]
-        if line.y_min - start_y > 700:
-            break
-        if _is_bottom_nav(line.text):
-            break
-        if idx != start_idx + 1 and _is_card_title_start(line.text):
-            break
-        if _is_organizer_line(line.text):
-            saw_organizer = True
-        if _is_datetime_line(line.text):
-            saw_datetime = True
-        if saw_organizer and saw_datetime:
-            return True
-
-    return False
-
-
 def _is_organizer_line(text: str) -> bool:
     return text.lower().strip().startswith("организато")
 
@@ -422,8 +399,17 @@ def _is_category_line(text: str) -> bool:
 
 
 def _is_format_line(text: str) -> bool:
-    lower = text.lower()
-    return any(keyword in lower for keyword in FORMAT_KEYWORDS)
+    lower = text.lower().strip()
+    return bool(
+        re.fullmatch(r"(парный\s+)?americano", lower)
+        or re.fullmatch(r"(парный\s+)?американо", lower)
+        or re.fullmatch(r"(парный\s+)?mexicano", lower)
+        or re.fullmatch(r"(парный\s+)?мексикано", lower)
+        or re.fullmatch(r"(парный\s+)?round\s+robin", lower)
+        or re.fullmatch(r"(парный\s+)?king", lower)
+        or re.fullmatch(r"(парный\s+)?escalera", lower)
+        or re.fullmatch(r"парный", lower)
+    )
 
 
 def _price_match(text: str) -> re.Match[str] | None:
