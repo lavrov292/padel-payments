@@ -14,6 +14,7 @@ from typing import Any
 from date_parser import MSK
 from exports import export_workbook
 from storage import connect, finalize_due_tournaments, init_db, tournament_summary
+from telegram_alerts import notify_cycle_problem, notify_pending_players, wait_for_pending_resolution
 
 
 def main() -> int:
@@ -33,6 +34,8 @@ def main() -> int:
     parser.add_argument("--participants-scroll-pixels", type=int, default=420)
     parser.add_argument("--launch", action="store_true")
     parser.add_argument("--exit-after-active-until", action="store_true")
+    parser.add_argument("--pending-check-seconds", type=int, default=30)
+    parser.add_argument("--disable-pending-wait", action="store_true")
     args = parser.parse_args()
 
     load_env_file(Path(args.env_file))
@@ -87,6 +90,22 @@ def main() -> int:
             first_cycle = False
             log_line(log, f"cycle {cycle_no} start command={' '.join(command)}")
             result = run_cycle(command, cycle_log, timeout_minutes=args.cycle_timeout_minutes)
+            if result != 0:
+                notify_cycle_problem(
+                    title=f"Cycle {cycle_no} failed",
+                    details=f"returncode={result}\nlog={cycle_log}",
+                )
+            if not args.disable_pending_wait:
+                with connect(db_path) as pending_conn:
+                    init_db(pending_conn)
+                    sent = notify_pending_players(pending_conn)
+                    if sent:
+                        log_line(log, f"telegram pending notifications sent: {sent}")
+                    wait_for_pending_resolution(
+                        pending_conn,
+                        poll_seconds=args.pending_check_seconds,
+                        log=log,
+                    )
             summary = finalize_and_export(db_path, output_dir, today)
             write_state(
                 state_path,

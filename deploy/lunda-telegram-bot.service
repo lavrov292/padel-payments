@@ -1,0 +1,17 @@
+[Unit]
+Description=Lunda Telegram admin bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lunda-collector/app/lunda_collector
+Environment=LUNDA_DB_PATH=/opt/lunda-collector/work/lunda_live/participant_window.sqlite3
+ExecStart=/opt/lunda-collector/app/.venv/bin/python -u /opt/lunda-collector/app/lunda_collector/telegram_admin_bot.py --db /opt/lunda-collector/work/lunda_live/participant_window.sqlite3 --env-file /opt/lunda-collector/app/.env
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/lunda-collector/work/lunda_telegram_bot.systemd.log
+StandardError=append:/opt/lunda-collector/work/lunda_telegram_bot.systemd.log
+
+[Install]
+WantedBy=multi-user.target
