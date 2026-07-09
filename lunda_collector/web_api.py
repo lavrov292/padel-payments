@@ -18,6 +18,16 @@ from fastapi.responses import HTMLResponse, Response
 DB_ENV = "LUNDA_DB_PATH"
 LEVEL_ORDER = ["D", "D+", "C", "C+", "B", "B+", "A"]
 LEVEL_INDEX = {level: idx for idx, level in enumerate(LEVEL_ORDER)}
+TOURNAMENT_TYPES = [
+    {"value": "individual", "label": "Индивидуальный"},
+    {"value": "pair", "label": "Парный"},
+    {"value": "women", "label": "Женский"},
+]
+TIME_PERIODS = [
+    {"value": "morning", "label": "Утро"},
+    {"value": "day", "label": "День"},
+    {"value": "evening", "label": "Вечер"},
+]
 
 
 app = FastAPI(title="Lunda Stats", version="0.1.0")
@@ -105,6 +115,60 @@ def level_matches(skill_level: str | None, selected_levels: set[str]) -> bool:
     return bool(parse_skill_levels(skill_level) & selected_levels)
 
 
+def tournament_type(row: sqlite3.Row | dict[str, Any]) -> str:
+    title = str(row["title"] or "").strip().lower()
+    unit = str(row["participants_unit"] or "").strip().lower()
+    if title.startswith("женский турнир"):
+        return "women"
+    if unit.startswith("команд"):
+        return "pair"
+    return "individual"
+
+
+def tournament_type_label(value: str) -> str:
+    labels = {item["value"]: item["label"] for item in TOURNAMENT_TYPES}
+    return labels.get(value, value)
+
+
+def time_period(row: sqlite3.Row | dict[str, Any]) -> str:
+    starts_at = row["starts_at"]
+    if not starts_at:
+        return ""
+    try:
+        start = datetime.fromisoformat(str(starts_at))
+    except ValueError:
+        return ""
+    minutes = start.hour * 60 + start.minute
+    if minutes < 11 * 60:
+        return "morning"
+    if 12 * 60 <= minutes < 17 * 60:
+        return "day"
+    if minutes >= 17 * 60:
+        return "evening"
+    return ""
+
+
+def time_period_label(value: str) -> str:
+    labels = {item["value"]: item["label"] for item in TIME_PERIODS}
+    return labels.get(value, value)
+
+
+def tournament_matches_extra_filters(
+    row: sqlite3.Row,
+    *,
+    selected_levels: set[str],
+    selected_types: set[str],
+    selected_periods: set[str],
+) -> bool:
+    if not level_matches(row["skill_level"], selected_levels):
+        return False
+    if selected_types and tournament_type(row) not in selected_types:
+        return False
+    if selected_periods and time_period(row) not in selected_periods:
+        return False
+    return True
+
+
 def parse_iso_date(value: str | None) -> date | None:
     if not value:
         return None
@@ -176,8 +240,14 @@ def organizer_color(organizer: str | None) -> str:
 
 def row_to_tournament(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
+    type_value = tournament_type(row)
+    period_value = time_period(row)
     result.pop("raw_json", None)
     result["level_tags"] = sorted(parse_skill_levels(result.get("skill_level")), key=lambda item: LEVEL_INDEX[item])
+    result["tournament_type"] = type_value
+    result["tournament_type_label"] = tournament_type_label(type_value)
+    result["time_period"] = period_value
+    result["time_period_label"] = time_period_label(period_value)
     result["color"] = organizer_color(result.get("organizer"))
     result["starts_at_display"] = format_time(result.get("starts_at"))
     result["ends_at"] = infer_ends_at(result.get("starts_at"), result.get("time_label"))
@@ -251,6 +321,8 @@ def filters() -> dict[str, Any]:
             "organizers": distinct("organizer"),
             "formats": distinct("format"),
             "levels": LEVEL_ORDER,
+            "tournament_types": TOURNAMENT_TYPES,
+            "time_periods": TIME_PERIODS,
             "date_min": conn.execute("SELECT MIN(tournament_date) FROM tournaments").fetchone()[0],
             "date_max": conn.execute("SELECT MAX(tournament_date) FROM tournaments").fetchone()[0],
         }
@@ -266,10 +338,14 @@ def players(
     organizer: list[str] | None = Query(default=None),
     level: list[str] | None = Query(default=None),
     format_value: list[str] | None = Query(default=None, alias="format"),
+    tournament_type_value: list[str] | None = Query(default=None, alias="tournament_type"),
+    time_period_value: list[str] | None = Query(default=None, alias="time_period"),
     search: str = "",
     limit: int = Query(default=500, ge=1, le=5000),
 ) -> dict[str, Any]:
     selected_levels = set(split_multi(level))
+    selected_types = set(split_multi(tournament_type_value))
+    selected_periods = set(split_multi(time_period_value))
     where_sql, params = tournament_filters(
         date_from=date_from,
         date_to=date_to,
@@ -292,7 +368,9 @@ def players(
                 t.organizer,
                 t.location,
                 t.skill_level,
-                t.format
+                t.format,
+                t.participants_unit,
+                t.starts_at
             FROM final_participations fp
             JOIN tournaments t ON t.id = fp.tournament_id
             LEFT JOIN players p ON p.id = fp.player_id
@@ -305,7 +383,12 @@ def players(
         search_lower = search.strip().lower()
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
-            if selected_levels and not level_matches(row["skill_level"], selected_levels):
+            if not tournament_matches_extra_filters(
+                row,
+                selected_levels=selected_levels,
+                selected_types=selected_types,
+                selected_periods=selected_periods,
+            ):
                 continue
             player_name = str(row["player_name"] or "")
             if not is_valid_player_name(player_name):
@@ -375,6 +458,8 @@ def tournaments(
     organizer: list[str] | None = Query(default=None),
     level: list[str] | None = Query(default=None),
     format_value: list[str] | None = Query(default=None, alias="format"),
+    tournament_type_value: list[str] | None = Query(default=None, alias="tournament_type"),
+    time_period_value: list[str] | None = Query(default=None, alias="time_period"),
 ) -> dict[str, Any]:
     if view == "day":
         target = date_value or today_iso()
@@ -383,6 +468,8 @@ def tournaments(
         date_from, date_to = week_bounds(date_value or None)
 
     selected_levels = set(split_multi(level))
+    selected_types = set(split_multi(tournament_type_value))
+    selected_periods = set(split_multi(time_period_value))
     where_sql, params = tournament_filters(
         date_from=date_from,
         date_to=date_to,
@@ -404,7 +491,16 @@ def tournaments(
             """,
             params,
         ).fetchall()
-        items = [row_to_tournament(row) for row in rows if level_matches(row["skill_level"], selected_levels)]
+        items = [
+            row_to_tournament(row)
+            for row in rows
+            if tournament_matches_extra_filters(
+                row,
+                selected_levels=selected_levels,
+                selected_types=selected_types,
+                selected_periods=selected_periods,
+            )
+        ]
         return {"items": items, "date_from": date_from, "date_to": date_to, "view": view}
     finally:
         conn.close()
@@ -437,7 +533,7 @@ HTML = r"""
     .tab { border: 1px solid rgba(255,255,255,.25); background: transparent; color: #fff; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
     .tab.active { background: #fff; color: #12202f; }
     .main { padding: 18px 24px 28px; display: grid; gap: 14px; }
-    .filters { background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 24px; display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 10px; align-items: end; }
+    .filters { background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 24px; display: grid; grid-template-columns: repeat(8, minmax(120px, 1fr)); gap: 10px; align-items: end; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     input, select { min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text); padding: 7px 9px; }
     select[multiple] { height: 80px; }
@@ -494,6 +590,8 @@ HTML = r"""
       <label>Организатор<select id="organizers" multiple></select></label>
       <label>Уровень<select id="levels" multiple></select></label>
       <label>Формат<select id="formats" multiple></select></label>
+      <label>Тип<select id="tournamentTypes" multiple></select></label>
+      <label>Время<select id="timePeriods" multiple></select></label>
       <label id="searchLabel">Игрок<input id="search" placeholder="поиск по имени"></label>
       <label id="viewLabel" class="hidden">Вид<select id="scheduleView"><option value="week">Неделя</option><option value="day">День</option></select></label>
       <div class="actions">
@@ -546,10 +644,16 @@ HTML = r"""
       for (const value of selected("organizers")) params.append("organizer", value);
       for (const value of selected("levels")) params.append("level", value);
       for (const value of selected("formats")) params.append("format", value);
+      for (const value of selected("tournamentTypes")) params.append("tournament_type", value);
+      for (const value of selected("timePeriods")) params.append("time_period", value);
       return params;
     }
     function fillSelect(id, values) {
-      qs(id).innerHTML = values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
+      qs(id).innerHTML = values.map((value) => {
+        const optionValue = typeof value === "object" ? value.value : value;
+        const label = typeof value === "object" ? value.label : value;
+        return `<option value="${escapeHtml(optionValue)}">${escapeHtml(label)}</option>`;
+      }).join("");
     }
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
@@ -569,6 +673,8 @@ HTML = r"""
       fillSelect("organizers", state.filters.organizers);
       fillSelect("levels", state.filters.levels);
       fillSelect("formats", state.filters.formats);
+      fillSelect("tournamentTypes", state.filters.tournament_types);
+      fillSelect("timePeriods", state.filters.time_periods);
       qs("dateFrom").value = state.filters.date_min || "";
       qs("dateTo").value = state.filters.date_max || "";
     }
@@ -597,6 +703,8 @@ HTML = r"""
       for (const value of selected("organizers")) params.append("organizer", value);
       for (const value of selected("levels")) params.append("level", value);
       for (const value of selected("formats")) params.append("format", value);
+      for (const value of selected("tournamentTypes")) params.append("tournament_type", value);
+      for (const value of selected("timePeriods")) params.append("time_period", value);
       const res = await fetch(apiUrl("/api/tournaments", params));
       const data = await res.json();
       state.tournaments = data.items;
@@ -654,7 +762,7 @@ HTML = r"""
           html += `<div class="event" data-id="${item.id}" style="background:${item.color}; top:${top}px; height:${blockHeight}px; left:${left}%; width:${width - 2}%">
             <div class="event-title">${escapeHtml(item.organizer || "")}</div>
             <div class="event-meta">${escapeHtml(item.starts_at_display)} ${escapeHtml(item.format || "")}</div>
-            <div class="event-meta">${escapeHtml(item.skill_level || "")} · ${escapeHtml(item.location || "")}</div>
+            <div class="event-meta">${escapeHtml(item.tournament_type_label || "")} · ${escapeHtml(item.skill_level || "")} · ${escapeHtml(item.location || "")}</div>
           </div>`;
         }
         html += `</div>`;
@@ -669,7 +777,8 @@ HTML = r"""
       qs("dayList").innerHTML = items.map((item) => `
         <div class="event-row" data-id="${item.id}" style="border-left-color:${item.color}">
           <strong>${escapeHtml(item.starts_at_display)} - ${escapeHtml(item.ends_at_display)} · ${escapeHtml(item.title)}</strong>
-          <div class="details">${escapeHtml(item.organizer)} · ${escapeHtml(item.location)} · ${escapeHtml(item.skill_level)} · ${escapeHtml(item.format)}</div>
+          <div class="details">${escapeHtml(item.organizer)} · ${escapeHtml(item.location)} · ${escapeHtml(item.tournament_type_label)} · ${escapeHtml(item.time_period_label)}</div>
+          <div class="details">${escapeHtml(item.skill_level)} · ${escapeHtml(item.format)}</div>
           <div class="details">${escapeHtml(item.price_label || "")} · ${item.final_participant_count || item.current_participant_count || 0} участников</div>
         </div>
       `).join("");
@@ -688,6 +797,8 @@ HTML = r"""
         <div><strong>Время:</strong> ${escapeHtml(item.tournament_date)} ${escapeHtml(item.time_label || "")}</div>
         <div><strong>Организатор:</strong> ${escapeHtml(item.organizer || "")}</div>
         <div><strong>Место:</strong> ${escapeHtml(item.location || "")}</div>
+        <div><strong>Тип:</strong> ${escapeHtml(item.tournament_type_label || "")}</div>
+        <div><strong>Время дня:</strong> ${escapeHtml(item.time_period_label || "")}</div>
         <div><strong>Уровень:</strong> ${escapeHtml(item.skill_level || "")}</div>
         <div><strong>Формат:</strong> ${escapeHtml(item.format || "")}</div>
         <div><strong>Стоимость:</strong> ${escapeHtml(item.price_label || "")}</div>
