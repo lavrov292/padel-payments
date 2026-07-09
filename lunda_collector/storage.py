@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from clubs import normalize_club_name
 from date_parser import MSK, iso_or_empty, parse_tournament_datetime
 from player_matcher import normalize_name, resolve_player
 from visible_cards import build_merge_key
@@ -326,7 +327,7 @@ def prepare_tournament_card(card: dict[str, Any], *, now_iso: str | None = None)
 
     title = _clean_text(card.get("title", ""))
     organizer = _clean_text(card.get("organizer", ""))
-    location = _clean_text(card.get("location", ""))
+    location = normalize_club_name(_clean_text(card.get("location", "")))
     skill_level = _clean_text(card.get("skill_level", ""))
     format_value = _clean_text(card.get("format", ""))
     price_label = _clean_text(card.get("price", ""))

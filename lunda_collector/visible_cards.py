@@ -4,6 +4,8 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from clubs import normalize_club_name
+
 
 @dataclass
 class OCRLine:
@@ -448,7 +450,7 @@ def _normalize_location(location: str) -> str:
     text = re.sub(r"\s*\|\s*(?=$)", "", text)
     text = re.sub(r"^\s*\|\s*", "", text)
     text = re.sub(r"\s{2,}", " ", text)
-    return text.strip(" |,-")
+    return normalize_club_name(text)
 
 
 def _normalize_price(text: str, match: re.Match[str]) -> str:
