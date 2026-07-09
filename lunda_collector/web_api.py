@@ -206,7 +206,7 @@ def tournament_filters(
     filters: list[str] = []
     params: list[Any] = []
     if not include_cancelled:
-        filters.append("t.source_status != 'cancelled'")
+        filters.append("t.source_status NOT IN ('cancelled', 'missing')")
     if date_from:
         filters.append("t.tournament_date >= ?")
         params.append(date_from)
