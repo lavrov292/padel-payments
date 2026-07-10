@@ -357,6 +357,11 @@ def is_persistable_tournament_card(card: dict[str, Any]) -> bool:
     return bool(card.get("is_complete"))
 
 
+def is_persistable_schedule_card(card: dict[str, Any]) -> bool:
+    required_fields = ("title", "organizer", "date", "time", "location")
+    return all(str(card.get(field, "")).strip() for field in required_fields)
+
+
 def build_tournament_identity_key(card: dict[str, Any], starts_at: datetime | None = None) -> str:
     organizer = normalize_identity_part(card.get("organizer", ""))
     location = normalize_identity_part(card.get("location", ""))

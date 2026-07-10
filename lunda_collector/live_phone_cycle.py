@@ -31,6 +31,7 @@ from storage import (
     connect,
     finalize_due_tournaments,
     init_db,
+    is_persistable_schedule_card,
     is_persistable_tournament_card,
     mark_tournament_cancelled,
     mark_tournament_missing,
@@ -244,7 +245,7 @@ def collect_schedule(
                 parsed = parse_tournament_datetime(str(card.get("date", "")), str(card.get("time", "")))
                 if parsed.tournament_date != target_date:
                     continue
-            if not is_persistable_tournament_card(card):
+            if not is_persistable_schedule_card(card):
                 continue
             upsert_tournament_from_card(conn, card, run_id=run_id, source="live_schedule")
             stats["upserted"] += 1

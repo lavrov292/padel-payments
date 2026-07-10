@@ -239,8 +239,18 @@ def _parse_card(lines: list[OCRLine]) -> dict[str, Any] | None:
     title = _normalize_title(_join_wrapped(title_parts))
     organizer = _normalize_organizer(_join_wrapped(organizer_parts))
     location = _normalize_location(_join_wrapped(location_parts))
+    organizer, date_value, time_value, location = _split_embedded_schedule_from_organizer(
+        organizer,
+        date_value,
+        time_value,
+        location,
+    )
     location, category = _split_location_and_skill_level(location, category)
     location = _normalize_location(location)
+    if not category:
+        category = _infer_skill_level_from_title(title)
+    if not format_value:
+        format_value = _infer_format_from_title(title)
 
     if not title and not organizer:
         return None
@@ -305,6 +315,9 @@ def build_merge_key(card: dict[str, Any]) -> str:
     time_value = str(card.get("time", "")).strip()
     location = str(card.get("location", "")).strip()
     format_value = str(card.get("format", "")).strip()
+
+    if organizer and date_value and time_value and location:
+        return _normalize_key("|".join(["venue", organizer, date_value, time_value, location]))
 
     secondary_fields = (date_value, time_value, location, format_value)
     if all(secondary_fields):
@@ -444,6 +457,71 @@ def _normalize_organizer(organizer: str) -> str:
     return re.sub(r"\s+", " ", organizer).strip(" |,-")
 
 
+def _split_embedded_schedule_from_organizer(
+    organizer: str,
+    date_value: str,
+    time_value: str,
+    location: str,
+) -> tuple[str, str, str, str]:
+    match = re.search(
+        r"\b(?P<weekday>Пн|Вт|Ср|Чт|Пт|Сб|Вс)\b\s+"
+        r"(?P<day>\d{1,2})\s+"
+        r"(?P<month>[а-яё.]{2,})",
+        organizer,
+        re.IGNORECASE,
+    )
+    if not match:
+        return organizer, date_value, time_value, location
+
+    organizer_head = _normalize_organizer(organizer[: match.start()])
+    tail = organizer[match.start() :].strip()
+    if not date_value:
+        date_value = _normalize_date_label(match)
+
+    time_match = re.search(
+        r"(?P<start>\d{1,2}[:.]\d{2})\s*[-–—]\s*(?P<end>\d{1,2}[:.]\d{2})",
+        tail,
+    )
+    location_tail = tail[match.end() - match.start() :]
+    if time_match:
+        if not time_value:
+            time_value = f"{time_match.group('start').replace('.', ':')} - {time_match.group('end').replace('.', ':')}"
+        location_tail = tail[time_match.end() :]
+
+    if not location and location_tail:
+        location_tail = re.sub(r"^[\s|:.,\\-–—0-9*]+", "", location_tail).strip()
+        if location_tail:
+            location = _normalize_location(location_tail)
+
+    return organizer_head or organizer, date_value, time_value, location
+
+
+def _normalize_date_label(match: re.Match[str]) -> str:
+    weekday = match.group("weekday").capitalize()
+    day = match.group("day")
+    month = match.group("month").lower().replace(".", "").replace("ё", "е")
+    month_map = {
+        "янв": "января",
+        "фев": "февраля",
+        "мар": "марта",
+        "апр": "апреля",
+        "ма": "мая",
+        "июн": "июня",
+        "июл": "июля",
+        "авг": "августа",
+        "сен": "сентября",
+        "сент": "сентября",
+        "окт": "октября",
+        "ноя": "ноября",
+        "дек": "декабря",
+    }
+    for prefix, normalized in month_map.items():
+        if month.startswith(prefix):
+            month = normalized
+            break
+    return f"{weekday} {day} {month}"
+
+
 def _normalize_location(location: str) -> str:
     text = re.sub(r"\bсанкт\s*[- ]\s*петербург\b", "", location, flags=re.IGNORECASE)
     text = re.sub(r"\bсанкт\s*[- ]?\s*пет(?:ербур(?:г|.)?)?\b", "", text, flags=re.IGNORECASE)
@@ -464,6 +542,7 @@ def _normalize_skill_level(text: str) -> str:
     text = text.strip()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\s*\([^)]*\)", "", text).strip()
+    text = re.sub(r"\s*\([^)]*$", "", text).strip()
     repeated = re.fullmatch(r"([A-D][+-]?)\s+\1", text, re.IGNORECASE)
     if repeated:
         return repeated.group(1).upper()
@@ -471,6 +550,37 @@ def _normalize_skill_level(text: str) -> str:
     if compact_pair and compact_pair.group(1).upper() == compact_pair.group(2).upper():
         return compact_pair.group(1).upper()
     return text.upper().replace("..", "…")
+
+
+def _infer_skill_level_from_title(title: str) -> str:
+    text = title.replace("...", "…")
+    range_match = re.search(r"\b([A-D][+]?)\s*[-–—.…]+\s*([A-D][+]?)\b", text, re.IGNORECASE)
+    if range_match:
+        return _normalize_skill_level(f"{range_match.group(1)}…{range_match.group(2)}")
+
+    compact_match = re.search(r"\b([A-D][+])([A-D])\b", text, re.IGNORECASE)
+    if compact_match:
+        return _normalize_skill_level(f"{compact_match.group(1)}…{compact_match.group(2)}")
+
+    single_match = re.search(r"\b([A-D][+]?)\b", text, re.IGNORECASE)
+    if single_match:
+        return _normalize_skill_level(single_match.group(1))
+    return ""
+
+
+def _infer_format_from_title(title: str) -> str:
+    lower = title.lower()
+    if "round robin" in lower:
+        return "Парный Round Robin" if "парный" in lower else "Round Robin"
+    if "mexicano" in lower or "мексикано" in lower:
+        return "Mexicano"
+    if "americano" in lower or "американо" in lower:
+        return "Americano"
+    if re.search(r"\bking\b", lower):
+        return "King"
+    if "парный" in lower:
+        return "Парный"
+    return ""
 
 
 def _split_location_and_skill_level(location: str, skill_level: str) -> tuple[str, str]:
