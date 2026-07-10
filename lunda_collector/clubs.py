@@ -22,6 +22,7 @@ CANONICAL_CLUBS = (
     "PRIM-PADEL на Шаврова",
     "GAZPADEL",
     "Спорт-клуб Лесной Олень",
+    "Маршал Арена",
 )
 
 
@@ -38,6 +39,7 @@ def normalize_club_name(value: str) -> str:
 
     aliases = {
         "winwin": "Падел Клуб WIN WIN",
+        "паделклуnwin": "Падел Клуб WIN WIN",
         "ракетаспб": "Ракета СПБ",
         "вмяч": "ВМЯЧ",
         "культпадел": "КультПадел",
@@ -46,6 +48,7 @@ def normalize_club_name(value: str) -> str:
         "тенниспадел": "Da Sport теннис и падел",
         "k5padel": "K5 Padel",
         "астрападел": "Астра Падел Клуб",
+        "астрапад": "Астра Падел Клуб",
         "viborapadel": "Vibora Padel Club",
         "vibora20padel": "Vibora Padel Club",
         "паделклубнева": "Падел клуб Нева",
@@ -58,6 +61,13 @@ def normalize_club_name(value: str) -> str:
         "primpadel": "PRIM-PADEL на Шаврова",
         "gazpadel": "GAZPADEL",
         "леснойолень": "Спорт-клуб Лесной Олень",
+        "маршаларена": "Маршал Арена",
+        "pari": "PARI Padel Arsenal",
+        "paripade": "PARI Padel Arsenal",
+        "arsenal": "PARI Padel Arsenal",
+        "ракета": "Ракета СПБ",
+        "ракетасг": "Ракета СПБ",
+        "паделкла": "Падел клуб Нева",
     }
     for alias, club in aliases.items():
         if alias in comparable:
