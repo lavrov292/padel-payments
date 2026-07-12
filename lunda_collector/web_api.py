@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+from io import BytesIO
 import json
 import os
 import re
@@ -465,6 +466,61 @@ def players(
         conn.close()
 
 
+@app.get("/api/players/export")
+def export_players(
+    date_from: str = "",
+    date_to: str = "",
+    location: list[str] | None = Query(default=None),
+    organizer: list[str] | None = Query(default=None),
+    level: list[str] | None = Query(default=None),
+    format_value: list[str] | None = Query(default=None, alias="format"),
+    tournament_type_value: list[str] | None = Query(default=None, alias="tournament_type"),
+    time_period_value: list[str] | None = Query(default=None, alias="time_period"),
+    rating_min: float | None = Query(default=None, ge=1, le=7),
+    rating_max: float | None = Query(default=None, ge=1, le=7),
+    search: str = "",
+    limit: int = Query(default=5000, ge=1, le=10000),
+) -> Response:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    payload = players(
+        date_from=date_from,
+        date_to=date_to,
+        location=location,
+        organizer=organizer,
+        level=level,
+        format_value=format_value,
+        tournament_type_value=tournament_type_value,
+        time_period_value=time_period_value,
+        rating_min=rating_min,
+        rating_max=rating_max,
+        search=search,
+        limit=limit,
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Players"
+    ws.append(["player_name"])
+    for item in payload["items"]:
+        ws.append([item["player_name"]])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="E8EEF7")
+    ws.freeze_panes = "A2"
+    ws.column_dimensions["A"].width = 34
+
+    stream = BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return Response(
+        stream.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="lunda_players_export.xlsx"'},
+    )
+
+
 @app.get("/api/tournaments")
 def tournaments(
     view: str = Query(default="week", pattern="^(day|week)$"),
@@ -616,6 +672,7 @@ HTML = r"""
       <label id="viewLabel" class="hidden">Вид<select id="scheduleView"><option value="week">Неделя</option><option value="day">День</option></select></label>
       <div class="actions">
         <button class="btn primary" id="apply">Показать</button>
+        <button class="btn" id="exportPlayers" type="button">Excel</button>
         <button class="btn" id="reset">Сброс</button>
       </div>
     </section>
@@ -729,6 +786,14 @@ HTML = r"""
           <td>${tags(item.levels)}</td>
         </tr>
       `).join("");
+    }
+    function playerParams() {
+      const params = paramsBase();
+      if (qs("search").value.trim()) params.set("search", qs("search").value.trim());
+      if (qs("ratingMin").value) params.set("rating_min", qs("ratingMin").value);
+      if (qs("ratingMax").value) params.set("rating_max", qs("ratingMax").value);
+      params.set("limit", "10000");
+      return params;
     }
     async function loadSchedule() {
       const params = new URLSearchParams();
@@ -852,6 +917,7 @@ HTML = r"""
       qs("searchLabel").classList.toggle("hidden", tab !== "players");
       qs("ratingMinLabel").classList.toggle("hidden", tab !== "players");
       qs("ratingMaxLabel").classList.toggle("hidden", tab !== "players");
+      qs("exportPlayers").classList.toggle("hidden", tab !== "players");
       qs("viewLabel").classList.toggle("hidden", tab !== "schedule");
       document.querySelector(".week-nav").classList.toggle("hidden", tab !== "schedule");
       refresh();
@@ -861,6 +927,9 @@ HTML = r"""
       else await loadSchedule();
     }
     qs("apply").addEventListener("click", refresh);
+    qs("exportPlayers").addEventListener("click", () => {
+      window.location.href = apiUrl("/api/players/export", playerParams());
+    });
     qs("prevWeek").addEventListener("click", () => shiftSchedule(-7));
     qs("thisWeek").addEventListener("click", () => {
       const start = monday();
