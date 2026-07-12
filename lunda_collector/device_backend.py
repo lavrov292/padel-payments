@@ -116,31 +116,49 @@ class YandexOCRClient:
             raise RuntimeError("YANDEX_OCR_API_KEY and YANDEX_OCR_FOLDER_ID are required")
 
         content = base64.b64encode(Path(image_path).read_bytes()).decode("utf-8")
-        response = requests.post(
-            YANDEX_OCR_URL,
-            headers={
-                "Authorization": f"Api-Key {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "folderId": self.folder_id,
-                "analyzeSpecs": [
-                    {
-                        "content": content,
-                        "features": [
-                            {
-                                "type": "TEXT_DETECTION",
-                                "textDetectionConfig": {"languageCodes": ["ru", "en"]},
-                            }
-                        ],
-                    }
-                ],
-            },
-            timeout=40,
-        )
+        payload = {
+            "folderId": self.folder_id,
+            "analyzeSpecs": [
+                {
+                    "content": content,
+                    "features": [
+                        {
+                            "type": "TEXT_DETECTION",
+                            "textDetectionConfig": {"languageCodes": ["ru", "en"]},
+                        }
+                    ],
+                }
+            ],
+        }
+        headers = {
+            "Authorization": f"Api-Key {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(YANDEX_OCR_URL, headers=headers, json=payload, timeout=40)
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == 3:
+                    raise
+                time.sleep(2 * attempt)
+                continue
+
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code >= 500 and attempt < 3:
+                last_error = RuntimeError(f"Yandex OCR failed: {response.status_code} {response.text}")
+                time.sleep(2 * attempt)
+                continue
+            break
+
         if response.status_code != 200:
             raise RuntimeError(f"Yandex OCR failed: {response.status_code} {response.text}")
-        return response.json()
+        if last_error:
+            raise last_error
+        return None
 
     def extract_text_from_result(self, ocr_result: dict[str, Any]) -> str:
         text_blocks: list[str] = []
