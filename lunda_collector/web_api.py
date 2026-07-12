@@ -340,6 +340,8 @@ def players(
     format_value: list[str] | None = Query(default=None, alias="format"),
     tournament_type_value: list[str] | None = Query(default=None, alias="tournament_type"),
     time_period_value: list[str] | None = Query(default=None, alias="time_period"),
+    rating_min: float | None = Query(default=None, ge=1, le=7),
+    rating_max: float | None = Query(default=None, ge=1, le=7),
     search: str = "",
     limit: int = Query(default=500, ge=1, le=5000),
 ) -> dict[str, Any]:
@@ -441,10 +443,15 @@ def players(
 
         result = []
         for item in grouped.values():
+            latest_rating = item["latest_rating"]
+            if rating_min is not None and (latest_rating is None or float(latest_rating) < rating_min):
+                continue
+            if rating_max is not None and (latest_rating is None or float(latest_rating) > rating_max):
+                continue
             result.append(
                 {
                     **item,
-                    "latest_rating": item["latest_rating"],
+                    "latest_rating": latest_rating,
                     "locations": sorted(item["locations"]),
                     "organizers": sorted(item["organizers"]),
                     "levels": sorted(item["levels"]),
@@ -603,6 +610,8 @@ HTML = r"""
       <label>Тип<select id="tournamentTypes" multiple></select></label>
       <label>Время<select id="timePeriods" multiple></select></label>
       <label id="searchLabel">Игрок<input id="search" placeholder="поиск по имени"></label>
+      <label id="ratingMinLabel">Рейтинг от<input id="ratingMin" type="number" min="1" max="7" step="0.01" placeholder="1.00"></label>
+      <label id="ratingMaxLabel">Рейтинг до<input id="ratingMax" type="number" min="1" max="7" step="0.01" placeholder="7.00"></label>
       <label id="viewLabel" class="hidden">Вид<select id="scheduleView"><option value="week">Неделя</option><option value="day">День</option></select></label>
       <div class="actions">
         <button class="btn primary" id="apply">Показать</button>
@@ -691,6 +700,8 @@ HTML = r"""
     async function loadPlayers() {
       const params = paramsBase();
       if (qs("search").value.trim()) params.set("search", qs("search").value.trim());
+      if (qs("ratingMin").value) params.set("rating_min", qs("ratingMin").value);
+      if (qs("ratingMax").value) params.set("rating_max", qs("ratingMax").value);
       const res = await fetch(apiUrl("/api/players", params));
       const data = await res.json();
       qs("playersSummary").textContent = `Игроков: ${data.total}`;
@@ -825,6 +836,8 @@ HTML = r"""
       qs("playersView").classList.toggle("hidden", tab !== "players");
       qs("scheduleViewBox").classList.toggle("hidden", tab !== "schedule");
       qs("searchLabel").classList.toggle("hidden", tab !== "players");
+      qs("ratingMinLabel").classList.toggle("hidden", tab !== "players");
+      qs("ratingMaxLabel").classList.toggle("hidden", tab !== "players");
       qs("viewLabel").classList.toggle("hidden", tab !== "schedule");
       refresh();
     }
@@ -836,6 +849,8 @@ HTML = r"""
     qs("reset").addEventListener("click", () => {
       document.querySelectorAll("select").forEach((select) => Array.from(select.options).forEach((option) => option.selected = false));
       qs("search").value = "";
+      qs("ratingMin").value = "";
+      qs("ratingMax").value = "";
       qs("dateFrom").value = state.filters?.date_min || "";
       qs("dateTo").value = state.filters?.date_max || "";
       qs("scheduleView").value = "week";
