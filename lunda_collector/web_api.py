@@ -568,6 +568,7 @@ HTML = r"""
     .tag { display: inline-flex; padding: 2px 6px; border-radius: 5px; background: #eef2f7; color: #344054; font-size: 12px; }
     .details { color: var(--muted); font-size: 12px; margin-top: 3px; }
     .calendar-tools { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .week-nav { display: flex; gap: 8px; align-items: center; }
     .calendar { display: grid; grid-template-columns: 58px repeat(7, 1fr); border-top: 1px solid var(--line); border-left: 1px solid var(--line); background: #fff; min-height: 720px; }
     .time-col, .day-col { position: relative; border-right: 1px solid var(--line); }
     .day-head, .time-head { height: 38px; border-bottom: 1px solid var(--line); background: #eef2f7; padding: 9px; font-weight: 700; }
@@ -631,6 +632,11 @@ HTML = r"""
       <section id="scheduleViewBox" class="hidden">
         <div class="calendar-tools">
           <div class="summary" id="scheduleSummary"></div>
+          <div class="week-nav">
+            <button class="btn" id="prevWeek" type="button">Назад</button>
+            <button class="btn" id="thisWeek" type="button">Текущая</button>
+            <button class="btn" id="nextWeek" type="button">Вперёд</button>
+          </div>
         </div>
         <div id="weekCalendar" class="panel calendar"></div>
         <div id="dayList" class="day-list hidden"></div>
@@ -646,6 +652,7 @@ HTML = r"""
     const qs = (id) => document.getElementById(id);
     const selected = (id) => Array.from(qs(id).selectedOptions).map((option) => option.value);
     const pad = (n) => String(n).padStart(2, "0");
+    const multiSelectIds = ["locations", "organizers", "levels", "formats", "tournamentTypes", "timePeriods"];
 
     function monday(value) {
       const d = value ? new Date(value + "T00:00:00") : new Date();
@@ -655,6 +662,13 @@ HTML = r"""
     }
     function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
     function addDays(d, count) { const x = new Date(d); x.setDate(x.getDate() + count); return x; }
+    function shiftSchedule(days) {
+      const base = qs("dateFrom").value || isoDate(new Date());
+      const shifted = addDays(monday(base), days);
+      qs("dateFrom").value = isoDate(shifted);
+      qs("dateTo").value = isoDate(addDays(shifted, 6));
+      if (state.tab === "schedule") refresh();
+    }
     function paramsBase() {
       const params = new URLSearchParams();
       if (qs("dateFrom").value) params.set("date_from", qs("dateFrom").value);
@@ -839,6 +853,7 @@ HTML = r"""
       qs("ratingMinLabel").classList.toggle("hidden", tab !== "players");
       qs("ratingMaxLabel").classList.toggle("hidden", tab !== "players");
       qs("viewLabel").classList.toggle("hidden", tab !== "schedule");
+      document.querySelector(".week-nav").classList.toggle("hidden", tab !== "schedule");
       refresh();
     }
     async function refresh() {
@@ -846,6 +861,14 @@ HTML = r"""
       else await loadSchedule();
     }
     qs("apply").addEventListener("click", refresh);
+    qs("prevWeek").addEventListener("click", () => shiftSchedule(-7));
+    qs("thisWeek").addEventListener("click", () => {
+      const start = monday();
+      qs("dateFrom").value = isoDate(start);
+      qs("dateTo").value = isoDate(addDays(start, 6));
+      if (state.tab === "schedule") refresh();
+    });
+    qs("nextWeek").addEventListener("click", () => shiftSchedule(7));
     qs("reset").addEventListener("click", () => {
       document.querySelectorAll("select").forEach((select) => Array.from(select.options).forEach((option) => option.selected = false));
       qs("search").value = "";
@@ -858,6 +881,21 @@ HTML = r"""
     });
     qs("closeModal").addEventListener("click", () => qs("modal").close());
     document.querySelectorAll(".tab").forEach((btn) => btn.addEventListener("click", () => setTab(btn.dataset.tab)));
+    for (const id of multiSelectIds) {
+      const select = qs(id);
+      let beforeMouseDown = new Set();
+      select.addEventListener("mousedown", () => {
+        beforeMouseDown = new Set(selected(id));
+      });
+      select.addEventListener("click", (event) => {
+        if (event.target.tagName !== "OPTION") return;
+        const option = event.target;
+        if (!beforeMouseDown.has(option.value)) return;
+        event.preventDefault();
+        option.selected = false;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    }
     loadFilters().then(refresh);
   </script>
 </body>
