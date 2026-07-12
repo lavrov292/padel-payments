@@ -24,6 +24,12 @@ class OCRWord:
         return (self.y_min + self.y_max) // 2
 
 
+@dataclass
+class ParticipantRecord:
+    name: str
+    rating: float | None = None
+
+
 STOP_WORDS = {
     "турнир",
     "организатор",
@@ -55,6 +61,13 @@ STOP_WORDS = {
 
 
 def parse_participants_from_ocr(ocr_result: dict[str, Any], tournament_type: str = "auto") -> list[str]:
+    return [record.name for record in parse_participant_records_from_ocr(ocr_result, tournament_type=tournament_type)]
+
+
+def parse_participant_records_from_ocr(
+    ocr_result: dict[str, Any],
+    tournament_type: str = "auto",
+) -> list[ParticipantRecord]:
     lines = extract_ocr_lines(ocr_result)
     text_lower = "\n".join(line.text.lower() for line in lines)
 
@@ -65,7 +78,10 @@ def parse_participants_from_ocr(ocr_result: dict[str, Any], tournament_type: str
     if header_y is None:
         return []
 
-    return _parse_participant_rows(extract_words(ocr_result), header_y) or _parse_participant_lines(lines, header_y)
+    row_records = _parse_participant_row_records(extract_words(ocr_result), header_y)
+    if row_records:
+        return row_records
+    return [ParticipantRecord(name=name) for name in _parse_participant_lines(lines, header_y)]
 
 
 def extract_words(ocr_result: dict[str, Any]) -> list[OCRWord]:
@@ -179,8 +195,13 @@ def _parse_participant_lines(lines, header_y: int) -> list[str]:
 
 
 def _parse_participant_rows(words: list[OCRWord], header_y: int) -> list[str]:
+    return [record.name for record in _parse_participant_row_records(words, header_y)]
+
+
+def _parse_participant_row_records(words: list[OCRWord], header_y: int) -> list[ParticipantRecord]:
     candidates: list[dict[str, Any]] = []
-    participants: list[str] = []
+    participants: list[ParticipantRecord] = []
+    previous_rating_rows: list[dict[str, Any]] = []
 
     for row in _group_words_into_rows(words):
         if not row:
@@ -190,15 +211,26 @@ def _parse_participant_rows(words: list[OCRWord], header_y: int) -> list[str]:
         if y_min <= header_y + 20:
             continue
 
+        rating_values = [
+            rating
+            for word in row
+            if 60 <= word.x_center <= 220
+            for rating in [_parse_rating_value(word.text)]
+            if rating is not None
+        ]
         row_text = _participant_row_text(row)
         if is_departed_section(row_text):
             break
 
         candidate = _line_to_name_candidate(row_text)
         if not candidate:
+            if rating_values:
+                previous_rating_rows.append({"rating": rating_values[0], "y_max": y_max})
             continue
         tokens = candidate.split()
         if len(tokens) == 1 and y_min <= header_y + 100:
+            if rating_values:
+                previous_rating_rows.append({"rating": rating_values[0], "y_max": y_max})
             continue
 
         candidates.append(
@@ -208,8 +240,11 @@ def _parse_participant_rows(words: list[OCRWord], header_y: int) -> list[str]:
                 "y_min": y_min,
                 "y_max": y_max,
                 "x_min": min(word.x_min for word in row),
+                "rating": rating_values[0] if rating_values else _nearest_previous_rating(previous_rating_rows, y_min),
             }
         )
+        if rating_values:
+            previous_rating_rows.append({"rating": rating_values[0], "y_max": y_max})
 
     idx = 0
     while idx < len(candidates):
@@ -217,7 +252,7 @@ def _parse_participant_rows(words: list[OCRWord], header_y: int) -> list[str]:
         current_tokens = current["tokens"]
 
         if len(current_tokens) >= 2:
-            _append_unique(participants, current["name"])
+            _append_unique_record(participants, current["name"], current.get("rating"))
             idx += 1
             continue
 
@@ -226,11 +261,15 @@ def _parse_participant_rows(words: list[OCRWord], header_y: int) -> list[str]:
             next_tokens = next_item["tokens"]
             y_gap = next_item["y_min"] - current["y_max"]
             if len(next_tokens) == 1 and 0 <= y_gap <= 95:
-                _append_unique(participants, f"{current['name']} {next_item['name']}")
+                _append_unique_record(
+                    participants,
+                    f"{current['name']} {next_item['name']}",
+                    current.get("rating") or next_item.get("rating"),
+                )
                 idx += 2
                 continue
 
-        _append_unique(participants, current["name"])
+        _append_unique_record(participants, current["name"], current.get("rating"))
         idx += 1
 
     return participants
@@ -271,6 +310,20 @@ def _line_to_name_candidate(text: str) -> str:
 
 def _append_unique(participants: list[str], name: str) -> None:
     append_unique_participant(participants, name)
+
+
+def _append_unique_record(participants: list[ParticipantRecord], name: str, rating: float | None) -> None:
+    normalized = " ".join(name.split())
+    if not normalized:
+        return
+
+    for idx, existing in enumerate(participants):
+        if _same_participant_name(existing.name, normalized):
+            replacement = normalized if _participant_name_quality(normalized) > _participant_name_quality(existing.name) else existing.name
+            participants[idx] = ParticipantRecord(name=replacement, rating=rating if rating is not None else existing.rating)
+            return
+
+    participants.append(ParticipantRecord(name=normalized, rating=rating))
 
 
 def append_unique_participant(participants: list[str], name: str) -> None:
@@ -401,6 +454,30 @@ def _participant_compare_key(name: str) -> str:
     text = re.sub(r"[^a-zа-я\\s-]", " ", text, flags=re.IGNORECASE)
     text = text.replace("-", " ")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_rating_value(text: str) -> float | None:
+    normalized = text.strip().replace(",", ".")
+    if not re.fullmatch(r"\d{1,2}\.\d{2}", normalized):
+        return None
+    try:
+        value = float(normalized)
+    except ValueError:
+        return None
+    if 1.0 <= value <= 7.0:
+        return round(value, 2)
+    return None
+
+
+def _nearest_previous_rating(rows: list[dict[str, Any]], y_min: int) -> float | None:
+    candidates: list[tuple[int, float]] = []
+    for row in rows[-3:]:
+        gap = y_min - int(row["y_max"])
+        if -8 <= gap <= 75:
+            candidates.append((abs(gap - 30), float(row["rating"])))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: item[0])[0][1]
 
 
 def _levenshtein_distance(left: str, right: str) -> int:

@@ -17,6 +17,7 @@ from participants_parser import (
     append_unique_participant,
     is_departed_section,
     is_departed_status,
+    parse_participant_records_from_ocr,
     parse_participants_from_ocr,
 )
 from screen_nav import (
@@ -474,7 +475,7 @@ def open_card_and_collect_participants(
         return False
 
     expected_count = expected_people_count(card)
-    participant_names = scan_open_participants(
+    participant_records = scan_open_participants(
         ctx,
         tournament_type="team" if str(card.get("participants_unit", "")).startswith("команд") else "auto",
         expected_count=expected_count,
@@ -484,7 +485,7 @@ def open_card_and_collect_participants(
     snapshot_stats = record_participant_snapshot(
         conn,
         tournament_id,
-        participant_names,
+        participant_records,
         run_id=run_id,
         raw={"card": card},
     )
@@ -502,8 +503,8 @@ def scan_open_participants(
     expected_count: int,
     max_screens: int,
     scroll_pixels: int,
-) -> list[str]:
-    participants: list[str] = []
+) -> list[dict[str, Any]]:
+    participants: list[dict[str, Any]] = []
     no_new_count = 0
     for screen_idx in range(max_screens):
         captured = ctx.capture(f"participants_{screen_idx + 1:02d}")
@@ -515,12 +516,16 @@ def scan_open_participants(
         if departed_status_seen and not departed_marker_seen:
             break
 
-        found = parse_participants_from_ocr(ocr_result, tournament_type=tournament_type)
+        found = parse_participant_records_from_ocr(ocr_result, tournament_type=tournament_type)
         before = len(participants)
         for participant in found:
-            append_unique_participant(participants, participant)
+            append_unique_participant_record(participants, participant.name, participant.rating)
         added = len(participants) - before
-        print(f"Participants screen {screen_idx + 1}: found={len(found)} added={added} total={len(participants)}")
+        ratings_found = sum(1 for participant in found if participant.rating is not None)
+        print(
+            f"Participants screen {screen_idx + 1}: found={len(found)} ratings={ratings_found} "
+            f"added={added} total={len(participants)}"
+        )
 
         if expected_count and len(participants) >= expected_count:
             return participants[:expected_count]
@@ -533,6 +538,18 @@ def scan_open_participants(
         ctx.android.scroll_down(pixels=scroll_pixels)
         time.sleep(1.2)
     return participants
+
+
+def append_unique_participant_record(participants: list[dict[str, Any]], name: str, rating: float | None) -> None:
+    for participant in participants:
+        merged_name = [str(participant.get("name", ""))]
+        append_unique_participant(merged_name, name)
+        if len(merged_name) == 1:
+            participant["name"] = merged_name[0]
+            if participant.get("rating") is None and rating is not None:
+                participant["rating"] = rating
+            return
+    participants.append({"name": " ".join(name.split()), "rating": rating})
 
 
 def open_participants_section(ctx: LiveContext, *, max_scrolls: int = 12) -> bool:

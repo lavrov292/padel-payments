@@ -361,6 +361,8 @@ def players(
                 COALESCE(p.id, 0) AS player_id,
                 COALESCE(p.display_name, fp.raw_name) AS player_name,
                 fp.normalized_name,
+                fp.rating,
+                p.latest_rating,
                 t.id AS tournament_id,
                 t.tournament_date,
                 t.time_label,
@@ -405,10 +407,17 @@ def players(
                     "organizers": set(),
                     "levels": set(),
                     "formats": set(),
+                    "latest_rating": None,
+                    "latest_rating_at": "",
                     "tournaments": [],
                 },
             )
             item["tournament_count"] += 1
+            if row["rating"] is not None and str(row["starts_at"] or "") >= str(item["latest_rating_at"] or ""):
+                item["latest_rating"] = row["rating"]
+                item["latest_rating_at"] = row["starts_at"] or ""
+            elif item["latest_rating"] is None and row["latest_rating"] is not None:
+                item["latest_rating"] = row["latest_rating"]
             for field, target in [
                 ("location", "locations"),
                 ("organizer", "organizers"),
@@ -435,6 +444,7 @@ def players(
             result.append(
                 {
                     **item,
+                    "latest_rating": item["latest_rating"],
                     "locations": sorted(item["locations"]),
                     "organizers": sorted(item["organizers"]),
                     "levels": sorted(item["levels"]),
@@ -604,7 +614,7 @@ HTML = r"""
         <div class="summary" id="playersSummary"></div>
         <div class="panel">
           <table>
-            <thead><tr><th>Игрок</th><th>Участий</th><th>Клубы</th><th>Организаторы</th><th>Уровни</th></tr></thead>
+            <thead><tr><th>Игрок</th><th>Рейтинг</th><th>Участий</th><th>Клубы</th><th>Организаторы</th><th>Уровни</th></tr></thead>
             <tbody id="playersBody"></tbody>
           </table>
         </div>
@@ -687,6 +697,7 @@ HTML = r"""
       qs("playersBody").innerHTML = data.items.map((item) => `
         <tr>
           <td><div class="player-name">${escapeHtml(item.player_name)}</div><div class="details">${item.tournaments.slice(0, 3).map(t => `${t.date} ${t.time || ""} · ${t.title}`).join("<br>")}</div></td>
+          <td>${item.latest_rating == null ? "" : Number(item.latest_rating).toFixed(2)}</td>
           <td>${item.tournament_count}</td>
           <td>${tags(item.locations)}</td>
           <td>${tags(item.organizers)}</td>

@@ -42,10 +42,11 @@ def export_workbook(
     ws_players = wb.create_sheet("Players")
     _append_table(
         ws_players,
-        ["player_name", "tournament_count", "locations", "organizers", "levels"],
+        ["player_name", "latest_rating", "tournament_count", "locations", "organizers", "levels"],
         [
             [
                 row["player_name"],
+                row["latest_rating"] if row["latest_rating"] is not None else "",
                 row["tournament_count"],
                 row["locations"] or "",
                 row["organizers"] or "",
@@ -108,6 +109,7 @@ def export_workbook(
             t.organizer,
             t.location,
             COALESCE(p.display_name, fp.raw_name) AS player_name,
+            fp.rating,
             fp.resolve_status,
             fp.finalized_at
         FROM final_participations fp
@@ -118,7 +120,7 @@ def export_workbook(
     ).fetchall()
     _append_table(
         ws_final,
-        ["date", "time", "title", "organizer", "location", "player", "resolve_status", "finalized_at"],
+        ["date", "time", "title", "organizer", "location", "player", "rating", "resolve_status", "finalized_at"],
         [[row[column] or "" for column in row.keys()] for row in final_rows],
     )
 

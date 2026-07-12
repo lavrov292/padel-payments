@@ -98,7 +98,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             display_name TEXT NOT NULL,
             normalized_name TEXT NOT NULL UNIQUE,
             first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL
+            last_seen_at TEXT NOT NULL,
+            latest_rating REAL,
+            latest_rating_seen_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS player_aliases (
@@ -131,6 +133,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             raw_name TEXT NOT NULL,
             normalized_name TEXT NOT NULL,
             resolve_status TEXT NOT NULL,
+            rating REAL,
             active INTEGER NOT NULL DEFAULT 1,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
@@ -147,6 +150,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             raw_name TEXT NOT NULL,
             normalized_name TEXT NOT NULL,
             resolve_status TEXT NOT NULL,
+            rating REAL,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
             finalized_at TEXT NOT NULL,
@@ -161,7 +165,18 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_players(status);
         """
     )
+    _ensure_column(conn, "players", "latest_rating", "REAL")
+    _ensure_column(conn, "players", "latest_rating_seen_at", "TEXT")
+    _ensure_column(conn, "current_participants", "rating", "REAL")
+    _ensure_column(conn, "final_participations", "rating", "REAL")
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column in existing:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def start_run(conn: sqlite3.Connection, kind: str, *, now_iso: str | None = None) -> int:
@@ -387,14 +402,15 @@ def build_tournament_identity_key(card: dict[str, Any], starts_at: datetime | No
 def record_participant_snapshot(
     conn: sqlite3.Connection,
     tournament_id: int,
-    participant_names: list[str],
+    participant_names: list[Any],
     *,
     run_id: int | None = None,
     observed_at: str | None = None,
     raw: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     observed_at = observed_at or _now_iso()
-    cleaned_names = _unique_clean_names(participant_names)
+    participant_records = _unique_participant_records(participant_names)
+    cleaned_names = [record["name"] for record in participant_records]
 
     conn.execute(
         """
@@ -408,16 +424,20 @@ def record_participant_snapshot(
             run_id,
             tournament_id,
             observed_at,
-            len(cleaned_names),
-            json.dumps(cleaned_names, ensure_ascii=False),
+            len(participant_records),
+            json.dumps(participant_records, ensure_ascii=False),
             json.dumps(raw or {}, ensure_ascii=False),
         ),
     )
 
     seen_keys: set[str] = set()
-    stats = {"seen": len(cleaned_names), "resolved": 0, "pending": 0, "new": 0}
+    stats = {"seen": len(participant_records), "resolved": 0, "pending": 0, "new": 0, "ratings_seen": 0}
 
-    for raw_name in cleaned_names:
+    for record in participant_records:
+        raw_name = record["name"]
+        rating = record.get("rating")
+        if rating is not None:
+            stats["ratings_seen"] += 1
         resolution = resolve_player(
             conn,
             raw_name,
@@ -433,6 +453,8 @@ def record_participant_snapshot(
             stats["pending"] += 1
         elif resolution.player_id:
             stats["resolved"] += 1
+        if resolution.player_id and rating is not None:
+            _update_player_latest_rating(conn, resolution.player_id, rating, observed_at)
 
         existing = conn.execute(
             """
@@ -450,6 +472,7 @@ def record_participant_snapshot(
                     raw_name = ?,
                     normalized_name = ?,
                     resolve_status = ?,
+                    rating = COALESCE(?, rating),
                     active = 1,
                     last_seen_at = ?,
                     last_run_id = ?
@@ -460,6 +483,7 @@ def record_participant_snapshot(
                     raw_name,
                     resolution.normalized_name,
                     resolution.status,
+                    rating,
                     observed_at,
                     run_id,
                     int(existing["id"]),
@@ -470,10 +494,10 @@ def record_participant_snapshot(
                 """
                 INSERT INTO current_participants (
                     tournament_id, participant_key, player_id, raw_name,
-                    normalized_name, resolve_status, active, first_seen_at,
+                    normalized_name, resolve_status, rating, active, first_seen_at,
                     last_seen_at, last_run_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     tournament_id,
@@ -482,6 +506,7 @@ def record_participant_snapshot(
                     raw_name,
                     resolution.normalized_name,
                     resolution.status,
+                    rating,
                     observed_at,
                     observed_at,
                     run_id,
@@ -583,7 +608,7 @@ def finalize_due_tournaments(
         participants = conn.execute(
             """
             SELECT participant_key, player_id, raw_name, normalized_name,
-                   resolve_status, first_seen_at, last_seen_at
+                   resolve_status, rating, first_seen_at, last_seen_at
             FROM current_participants
             WHERE tournament_id = ? AND active = 1
             """,
@@ -594,15 +619,16 @@ def finalize_due_tournaments(
                 """
                 INSERT INTO final_participations (
                     tournament_id, participant_key, player_id, raw_name,
-                    normalized_name, resolve_status, first_seen_at,
+                    normalized_name, resolve_status, rating, first_seen_at,
                     last_seen_at, finalized_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tournament_id, participant_key) DO UPDATE SET
                     player_id = excluded.player_id,
                     raw_name = excluded.raw_name,
                     normalized_name = excluded.normalized_name,
                     resolve_status = excluded.resolve_status,
+                    rating = COALESCE(excluded.rating, final_participations.rating),
                     last_seen_at = excluded.last_seen_at,
                     finalized_at = excluded.finalized_at
                 """,
@@ -613,6 +639,7 @@ def finalize_due_tournaments(
                     participant["raw_name"],
                     participant["normalized_name"],
                     participant["resolve_status"],
+                    participant["rating"],
                     participant["first_seen_at"],
                     participant["last_seen_at"],
                     finalized_at,
@@ -691,6 +718,7 @@ def player_rankings(
         SELECT
             COALESCE(p.display_name, fp.raw_name) AS player_name,
             fp.normalized_name,
+            MAX(p.latest_rating) AS latest_rating,
             COUNT(*) AS tournament_count,
             GROUP_CONCAT(DISTINCT t.location) AS locations,
             GROUP_CONCAT(DISTINCT t.organizer) AS organizers,
@@ -823,6 +851,59 @@ def _unique_clean_names(values: list[str]) -> list[str]:
         seen.add(key)
         cleaned.append(text)
     return cleaned
+
+
+def _unique_participant_records(values: list[Any]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    cleaned: list[dict[str, Any]] = []
+    for value in values:
+        if isinstance(value, dict):
+            raw_name = value.get("name") or value.get("raw_name") or ""
+            rating = _rating_or_none(value.get("rating"))
+        else:
+            raw_name = getattr(value, "name", value)
+            rating = _rating_or_none(getattr(value, "rating", None))
+
+        text = _clean_text(raw_name)
+        key = normalize_name(text)
+        if not text or not key:
+            continue
+
+        if key in seen:
+            for existing in cleaned:
+                if normalize_name(existing["name"]) == key and existing.get("rating") is None and rating is not None:
+                    existing["rating"] = rating
+                    break
+            continue
+
+        seen.add(key)
+        cleaned.append({"name": text, "rating": rating})
+    return cleaned
+
+
+def _rating_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        rating = round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+    if 1.0 <= rating <= 7.0:
+        return rating
+    return None
+
+
+def _update_player_latest_rating(conn: sqlite3.Connection, player_id: int, rating: float, observed_at: str) -> None:
+    conn.execute(
+        """
+        UPDATE players
+        SET latest_rating = ?,
+            latest_rating_seen_at = ?,
+            last_seen_at = MAX(last_seen_at, ?)
+        WHERE id = ?
+        """,
+        (rating, observed_at, observed_at, player_id),
+    )
 
 
 def _clean_text(value: Any) -> str:
