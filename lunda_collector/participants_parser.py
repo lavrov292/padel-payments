@@ -42,7 +42,11 @@ STOP_WORDS = {
     "покинувшие",
     "покинувший",
     "вышел",
+    "в",
+    "и",
+    "го",
     "исключен",
+    "не",
     "владельцем",
     "парный",
     "round",
@@ -57,6 +61,42 @@ STOP_WORDS = {
     "приложении",
     "лунда",
     "турнира",
+    "авто",
+    "анонс",
+    "бери",
+    "водой",
+    "вы",
+    "кафе",
+    "компанию",
+    "кулер",
+    "можете",
+    "мойку",
+    "мячи",
+    "набранным",
+    "на",
+    "настроение",
+    "начиная",
+    "обеспечим",
+    "отличную",
+    "отличные",
+    "полотенца",
+    "присоединяйся",
+    "по",
+    "рейтингу",
+    "сауна",
+    "сертификаты",
+    "собой",
+    "с",
+    "со",
+    "стать",
+    "t",
+    "me",
+    "viborapadelchat",
+    "лет",
+    "от",
+    "формируются",
+    "хорошее",
+    "чате",
 }
 
 
@@ -295,14 +335,28 @@ def _line_to_name_candidate(text: str) -> str:
     if re.search(r"\d{2}\.\d{2}\.\d{4}", text):
         return ""
 
-    words = [word for word in re.findall(r"[A-Za-zА-Яа-яЁё-]+", text) if _is_name_word(word)]
+    raw_words = re.findall(r"[A-Za-zА-Яа-яЁё-]+", text)
+    words = [word for word in raw_words if _is_name_word(word)]
+    stop_words_removed = len(words) < len(raw_words)
     words = _strip_leading_avatar_initials(words)
+    words = _strip_trailing_avatar_tokens(words)
+    if not words:
+        return ""
+
+    words = _trim_suspicious_name_prefix(words)
+    words = _strip_trailing_avatar_tokens(words)
     if not words:
         return ""
 
     if len(words) == 1 and len(words[0]) <= 3 and any(char in text for char in "()"):
         return ""
     if len(words) == 1 and _looks_like_avatar_initials(words[0]):
+        return ""
+    if len(words) == 1 and stop_words_removed:
+        return ""
+    if len(words) > 3:
+        return ""
+    if len(words) == 3 and _looks_like_three_first_names(words):
         return ""
 
     return " ".join(words)
@@ -367,7 +421,10 @@ def _participant_row_text(row: list[OCRWord]) -> str:
 
 def _is_name_word(text: str) -> bool:
     normalized = text.strip(".,:;!?()[]{}«»\"'").lower()
-    if normalized in STOP_WORDS:
+    if not re.search(r"[A-Za-zА-Яа-яЁё]", normalized):
+        return False
+    stop_key = normalized.strip("-")
+    if stop_key in STOP_WORDS:
         return False
     if re.search(r"\d|https?|t\.me|@", normalized):
         return False
@@ -402,9 +459,78 @@ def _looks_like_left_avatar_badge(text: str) -> bool:
 
 def _strip_leading_avatar_initials(words: list[str]) -> list[str]:
     result = list(words)
-    while len(result) > 2 and _looks_like_multi_letter_avatar_initials(result[0]):
+    while len(result) > 1 and _looks_like_leading_avatar_token(result[0], result[1:3]):
         result.pop(0)
     return result
+
+
+def _looks_like_leading_avatar_token(token: str, next_words: list[str]) -> bool:
+    if _looks_like_multi_letter_avatar_initials(token):
+        return True
+    cleaned = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", token).lower()
+    if not cleaned or len(cleaned) > 3 or len(next_words) < 2:
+        return False
+    initials = "".join(word[0].lower() for word in next_words if word)
+    return bool(initials) and _levenshtein_distance(cleaned, initials) <= 1
+
+
+def _trim_suspicious_name_prefix(words: list[str]) -> list[str]:
+    if len(words) == 3:
+        if _looks_like_suspicious_prefix_word(words[0]) or _looks_like_repeated_surname_prefix(words):
+            return words[-2:]
+        return words
+    if len(words) < 3:
+        return words
+    prefix = words[:-2]
+    if all(_looks_like_suspicious_prefix_word(word) for word in prefix):
+        return words[-2:]
+    return words
+
+
+def _looks_like_suspicious_prefix_word(word: str) -> bool:
+    normalized = word.lower().replace("ё", "е")
+    if normalized in STOP_WORDS:
+        return True
+    if normalized in {"kl", "kr", "min", "град", "уградз", "ирока", "эль"}:
+        return True
+    if normalized.startswith(("криптовал", "работ", "рабат", "араб", "таю")):
+        return True
+    return word.isupper() and len(word) >= 3
+
+
+def _looks_like_repeated_surname_prefix(words: list[str]) -> bool:
+    if len(words) != 3:
+        return False
+    first = words[0].lower().replace("ё", "е")
+    second = words[1].lower().replace("ё", "е")
+    return first == second and words[0].isupper()
+
+
+def _strip_trailing_avatar_tokens(words: list[str]) -> list[str]:
+    result = list(words)
+    while len(result) > 1:
+        tail = result[-1]
+        normalized = tail.strip(".,:;!?()[]{}«»\"'").lower().replace("ё", "е")
+        if normalized in STOP_WORDS or _looks_like_multi_letter_avatar_initials(tail):
+            result.pop()
+            continue
+        break
+    return result
+
+
+COMMON_FIRST_NAMES = {
+    "алексей",
+    "артем",
+    "георгий",
+    "дмитрий",
+    "игорь",
+    "сергей",
+}
+
+
+def _looks_like_three_first_names(words: list[str]) -> bool:
+    normalized = [word.lower().replace("ё", "е") for word in words]
+    return all(word in COMMON_FIRST_NAMES for word in normalized)
 
 
 def _same_participant_name(left: str, right: str) -> bool:
