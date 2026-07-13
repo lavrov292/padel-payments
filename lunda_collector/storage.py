@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from clubs import normalize_club_name
+from clubs import is_canonical_club, normalize_club_name
 from date_parser import MSK, iso_or_empty, parse_tournament_datetime
 from player_matcher import normalize_name, resolve_player
 from visible_cards import build_merge_key
@@ -342,7 +342,10 @@ def prepare_tournament_card(card: dict[str, Any], *, now_iso: str | None = None)
 
     title = _clean_text(card.get("title", ""))
     organizer = _clean_text(card.get("organizer", ""))
-    location = normalize_club_name(_clean_text(card.get("location", "")))
+    location = normalize_club_name(
+        _clean_text(card.get("location", "")),
+        context=" ".join([title, organizer]),
+    )
     skill_level = _clean_text(card.get("skill_level", ""))
     format_value = _clean_text(card.get("format", ""))
     price_label = _clean_text(card.get("price", ""))
@@ -369,18 +372,27 @@ def prepare_tournament_card(card: dict[str, Any], *, now_iso: str | None = None)
 
 
 def is_persistable_tournament_card(card: dict[str, Any]) -> bool:
-    return bool(card.get("is_complete"))
+    return bool(card.get("is_complete")) and _has_known_location(card)
 
 
 def is_persistable_schedule_card(card: dict[str, Any]) -> bool:
     required_fields = ("title", "organizer", "date", "time", "location")
-    return all(str(card.get(field, "")).strip() for field in required_fields)
+    return all(str(card.get(field, "")).strip() for field in required_fields) and _has_known_location(card)
+
+
+def _has_known_location(card: dict[str, Any]) -> bool:
+    prepared = prepare_tournament_card(card)
+    return is_canonical_club(prepared["location"])
 
 
 def build_tournament_identity_key(card: dict[str, Any], starts_at: datetime | None = None) -> str:
     organizer = normalize_identity_part(card.get("organizer", ""))
-    location = normalize_identity_part(card.get("location", ""))
     title = normalize_identity_part(card.get("title", ""))
+    normalized_location = normalize_club_name(
+        _clean_text(card.get("location", "")),
+        context=" ".join([_clean_text(card.get("title", "")), _clean_text(card.get("organizer", ""))]),
+    )
+    location = normalize_identity_part(normalized_location)
     start_key = starts_at.isoformat() if starts_at else ""
 
     if organizer and start_key and location:
