@@ -894,6 +894,19 @@ def _unique_participant_records(values: list[Any]) -> list[dict[str, Any]]:
         if not text or not key:
             continue
 
+        replaced_by_full_name = False
+        for existing in cleaned:
+            if _same_rating(existing.get("rating"), rating) and _single_token_matches_full_name(existing["name"], text):
+                if len(text.split()) > len(str(existing["name"]).split()):
+                    existing["name"] = text
+                    seen.add(normalize_name(text))
+                if existing.get("rating") is None and rating is not None:
+                    existing["rating"] = rating
+                replaced_by_full_name = True
+                break
+        if replaced_by_full_name:
+            continue
+
         if key in seen:
             for existing in cleaned:
                 if normalize_name(existing["name"]) == key and existing.get("rating") is None and rating is not None:
@@ -916,6 +929,24 @@ def _rating_or_none(value: Any) -> float | None:
     if 1.0 <= rating <= 7.0:
         return rating
     return None
+
+
+def _same_rating(left: Any, right: Any) -> bool:
+    left_rating = _rating_or_none(left)
+    right_rating = _rating_or_none(right)
+    if left_rating is None or right_rating is None:
+        return False
+    return abs(left_rating - right_rating) < 0.005
+
+
+def _single_token_matches_full_name(left: str, right: str) -> bool:
+    left_parts = normalize_name(left).split()
+    right_parts = normalize_name(right).split()
+    if len(left_parts) == 1 and len(right_parts) >= 2:
+        return left_parts[0] in set(right_parts)
+    if len(right_parts) == 1 and len(left_parts) >= 2:
+        return right_parts[0] in set(left_parts)
+    return False
 
 
 def _update_player_latest_rating(conn: sqlite3.Connection, player_id: int, rating: float, observed_at: str) -> None:

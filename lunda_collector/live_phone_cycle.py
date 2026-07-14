@@ -541,15 +541,46 @@ def scan_open_participants(
 
 
 def append_unique_participant_record(participants: list[dict[str, Any]], name: str, rating: float | None) -> None:
+    normalized_name = " ".join(name.split())
+    if not normalized_name:
+        return
     for participant in participants:
-        merged_name = [str(participant.get("name", ""))]
-        append_unique_participant(merged_name, name)
+        existing_name = str(participant.get("name", ""))
+        existing_rating = participant.get("rating")
+        if _same_rating(existing_rating, rating) and _single_token_matches_full_name(existing_name, normalized_name):
+            if len(normalized_name.split()) > len(existing_name.split()):
+                participant["name"] = normalized_name
+            if participant.get("rating") is None and rating is not None:
+                participant["rating"] = rating
+            return
+
+        merged_name = [existing_name]
+        append_unique_participant(merged_name, normalized_name)
         if len(merged_name) == 1:
             participant["name"] = merged_name[0]
             if participant.get("rating") is None and rating is not None:
                 participant["rating"] = rating
             return
-    participants.append({"name": " ".join(name.split()), "rating": rating})
+    participants.append({"name": normalized_name, "rating": rating})
+
+
+def _same_rating(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return abs(float(left) - float(right)) < 0.005
+    except (TypeError, ValueError):
+        return False
+
+
+def _single_token_matches_full_name(left: str, right: str) -> bool:
+    left_parts = left.split()
+    right_parts = right.split()
+    if len(left_parts) == 1 and len(right_parts) >= 2:
+        return left_parts[0].lower().replace("ё", "е") in {part.lower().replace("ё", "е") for part in right_parts}
+    if len(right_parts) == 1 and len(left_parts) >= 2:
+        return right_parts[0].lower().replace("ё", "е") in {part.lower().replace("ё", "е") for part in left_parts}
+    return False
 
 
 def open_participants_section(ctx: LiveContext, *, max_scrolls: int = 12) -> bool:
