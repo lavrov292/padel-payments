@@ -16,6 +16,7 @@ from typing import Any
 
 from openpyxl import Workbook
 
+from player_matcher import find_candidate_players
 from storage import DEFAULT_DB_PATH, connect, init_db
 
 
@@ -127,11 +128,25 @@ def init_player_audit_db(conn: sqlite3.Connection) -> None:
             llm_reason TEXT,
             llm_merge_with TEXT,
             status TEXT NOT NULL DEFAULT 'open',
+            telegram_message_id INTEGER,
+            resolved_at TEXT,
+            resolved_by_telegram_id TEXT,
+            resolution_note TEXT,
             created_at TEXT NOT NULL
         )
         """
     )
+    ensure_column(conn, "player_name_audit", "telegram_message_id", "INTEGER")
+    ensure_column(conn, "player_name_audit", "resolved_at", "TEXT")
+    ensure_column(conn, "player_name_audit", "resolved_by_telegram_id", "TEXT")
+    ensure_column(conn, "player_name_audit", "resolution_note", "TEXT")
     conn.commit()
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def load_player_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -207,6 +222,24 @@ def heuristic_reasons(name: str, normalized: str, participation_count: int, rati
     if normalized in BAD_PHRASES:
         reasons.append("normalized_known_bad_phrase")
     return reasons
+
+
+def is_confident_garbage(row: PlayerAuditRow) -> bool:
+    strong = {
+        "known_ui_or_description_phrase",
+        "normalized_known_bad_phrase",
+        "too_many_words",
+        "contains_digit",
+    }
+    if any(reason in strong for reason in row.reasons):
+        return True
+    if "contains_connector_word_without_rating" in row.reasons and row.latest_rating is None:
+        return True
+    return False
+
+
+def is_review_needed(row: PlayerAuditRow) -> bool:
+    return bool(row.reasons) and not is_confident_garbage(row)
 
 
 def risk_score(row: PlayerAuditRow) -> int:
@@ -320,6 +353,41 @@ def split_compact(value: str, *, limit: int = 8) -> list[str]:
 
 def save_audit_results(conn: sqlite3.Connection, rows: list[PlayerAuditRow], created_at: str) -> None:
     for row in rows:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM player_name_audit
+            WHERE player_id = ?
+              AND status = 'open'
+            LIMIT 1
+            """,
+            (row.player_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE player_name_audit
+                SET display_name = ?,
+                    heuristic_status = ?,
+                    heuristic_reasons = ?,
+                    llm_status = ?,
+                    llm_confidence = ?,
+                    llm_reason = ?,
+                    llm_merge_with = ?
+                WHERE id = ?
+                """,
+                (
+                    row.name,
+                    row.heuristic_status,
+                    json.dumps(row.reasons, ensure_ascii=False),
+                    row.llm_status,
+                    row.llm_confidence,
+                    row.llm_reason,
+                    row.llm_merge_with,
+                    int(existing["id"]),
+                ),
+            )
+            continue
         conn.execute(
             """
             INSERT INTO player_name_audit (
@@ -342,6 +410,52 @@ def save_audit_results(conn: sqlite3.Connection, rows: list[PlayerAuditRow], cre
             ),
         )
     conn.commit()
+
+
+def load_open_audit_items(conn: sqlite3.Connection, *, limit: int = 20) -> list[sqlite3.Row]:
+    init_player_audit_db(conn)
+    return conn.execute(
+        """
+        SELECT
+            pna.*,
+            p.latest_rating,
+            p.normalized_name,
+            COUNT(DISTINCT fp.tournament_id) AS final_count,
+            COUNT(DISTINCT cp.tournament_id) AS current_count,
+            GROUP_CONCAT(DISTINCT COALESCE(tf.location, tc.location)) AS locations,
+            GROUP_CONCAT(DISTINCT COALESCE(tf.title, tc.title)) AS titles
+        FROM player_name_audit pna
+        JOIN players p ON p.id = pna.player_id
+        LEFT JOIN final_participations fp ON fp.player_id = p.id
+        LEFT JOIN tournaments tf ON tf.id = fp.tournament_id
+        LEFT JOIN current_participants cp ON cp.player_id = p.id
+        LEFT JOIN tournaments tc ON tc.id = cp.tournament_id
+        WHERE pna.status = 'open'
+          AND pna.telegram_message_id IS NULL
+        GROUP BY pna.id
+        ORDER BY
+            CASE
+                WHEN pna.heuristic_reasons LIKE '%known_ui_or_description_phrase%' THEN 0
+                WHEN pna.heuristic_reasons LIKE '%normalized_known_bad_phrase%' THEN 0
+                ELSE 1
+            END,
+            pna.id
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def audit_item_candidates(conn: sqlite3.Connection, row: sqlite3.Row) -> list[dict[str, Any]]:
+    return [
+        {
+            "player_id": candidate.player_id,
+            "name": candidate.name,
+            "dist": candidate.dist,
+            "score": candidate.score,
+        }
+        for candidate in find_candidate_players(conn, str(row["display_name"]), str(row["normalized_name"]), limit=5)
+    ]
 
 
 def write_xlsx(rows: list[PlayerAuditRow], path: Path) -> None:

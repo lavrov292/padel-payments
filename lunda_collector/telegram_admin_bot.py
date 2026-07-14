@@ -15,6 +15,7 @@ from invite_players import (
     list_active_my_tournaments,
     read_player_names_from_xlsx,
 )
+from player_audit import audit_item_candidates, init_player_audit_db, load_open_audit_items
 from storage import connect, init_db
 from telegram_alerts import (
     admin_chat_id,
@@ -47,6 +48,7 @@ def main() -> int:
     init_db(conn)
     init_invite_db(conn)
     init_invite_bot_db(conn)
+    init_player_audit_db(conn)
     telegram_request("deleteWebhook", {"drop_pending_updates": False})
     offset: int | None = None
     print(f"Telegram admin bot started for admin {admin_chat_id()}", flush=True)
@@ -76,7 +78,12 @@ def handle_update(conn, update: dict) -> None:
         return
     if text.startswith("/status"):
         rows = conn.execute("SELECT COUNT(*) FROM pending_players WHERE status = 'pending'").fetchone()[0]
-        notify_cycle_problem(title="Lunda status", details=f"Pending names: {rows}")
+        audit_rows = conn.execute("SELECT COUNT(*) FROM player_name_audit WHERE status = 'open'").fetchone()[0]
+        notify_cycle_problem(title="Lunda status", details=f"Pending names: {rows}\nAudit names: {audit_rows}")
+        return
+    if text.startswith("/audit"):
+        sent = notify_audit_items(conn)
+        notify_cycle_problem(title="Lunda audit", details=f"Audit messages sent: {sent}")
         return
     if text.startswith("/invite"):
         send_invite_tournament_picker(conn)
@@ -160,6 +167,10 @@ def handle_callback(conn, callback: dict) -> None:
         send_admin_message("❌ Приглашение отменено.")
         return
 
+    if data.startswith("lunda:audit:"):
+        handle_audit_callback(conn, callback_id=callback_id, user_id=user_id, chat_id=chat_id, message_id=message_id, data=data)
+        return
+
     parts = data.split(":")
     if len(parts) < 4 or parts[:2] != ["lunda", "pending"]:
         safe_answer_callback(callback_id, "Неизвестная команда")
@@ -204,6 +215,190 @@ def safe_answer_callback(callback_id: str, text: str = "") -> None:
         answer_callback(callback_id, text)
     except Exception as exc:
         print(f"telegram answerCallbackQuery failed: {exc}", file=sys.stderr, flush=True)
+
+
+def notify_audit_items(conn, *, limit: int = 20) -> int:
+    rows = load_open_audit_items(conn, limit=limit)
+    sent = 0
+    for row in rows:
+        message_id = send_admin_message(
+            audit_message(conn, row),
+            reply_markup=audit_keyboard(int(row["id"]), audit_item_candidates(conn, row)),
+        )
+        if message_id:
+            conn.execute(
+                "UPDATE player_name_audit SET telegram_message_id = ? WHERE id = ?",
+                (message_id, int(row["id"])),
+            )
+            sent += 1
+    conn.commit()
+    return sent
+
+
+def audit_message(conn, row) -> str:
+    reasons = ", ".join(json.loads(row["heuristic_reasons"] or "[]"))
+    candidates = audit_item_candidates(conn, row)
+    lines = [
+        "🧹 Проверка OCR-имени",
+        "",
+        f"Имя: {row['display_name']}",
+        f"player_id: {row['player_id']}",
+        f"Рейтинг: {row['latest_rating'] if row['latest_rating'] is not None else 'нет'}",
+        f"Участий: final={row['final_count'] or 0}, current={row['current_count'] or 0}",
+        f"Причины: {reasons}",
+    ]
+    if row["locations"]:
+        lines.append(f"Клубы: {row['locations']}")
+    if row["titles"]:
+        lines.append(f"Турниры: {row['titles']}")
+    if candidates:
+        lines.append("")
+        lines.append("Похожие игроки:")
+        for candidate in candidates[:5]:
+            lines.append(f"- #{candidate['player_id']} {candidate['name']} (dist={candidate['dist']})")
+    return "\n".join(lines)
+
+
+def audit_keyboard(audit_id: int, candidates: list[dict]) -> dict:
+    rows = [
+        [{"text": "🗑 Удалить мусор", "callback_data": f"lunda:audit:{audit_id}:delete"}],
+        [{"text": "✅ Это игрок, оставить", "callback_data": f"lunda:audit:{audit_id}:keep"}],
+    ]
+    for candidate in candidates[:3]:
+        rows.append(
+            [
+                {
+                    "text": f"🔗 Склеить с {candidate['name']}"[:60],
+                    "callback_data": f"lunda:audit:{audit_id}:merge:{candidate['player_id']}",
+                }
+            ]
+        )
+    rows.append([{"text": "⏸ Потом", "callback_data": f"lunda:audit:{audit_id}:later"}])
+    return {"inline_keyboard": rows}
+
+
+def handle_audit_callback(conn, *, callback_id: str, user_id: str, chat_id, message_id, data: str) -> None:
+    parts = data.split(":")
+    if len(parts) < 4:
+        safe_answer_callback(callback_id, "Не понял")
+        return
+    audit_id = int(parts[2])
+    action = parts[3]
+    merge_player_id = int(parts[4]) if action == "merge" and len(parts) > 4 else None
+    try:
+        note = resolve_audit_item(conn, audit_id=audit_id, action=action, merge_player_id=merge_player_id, user_id=user_id)
+        safe_answer_callback(callback_id, "Готово")
+        if chat_id and message_id:
+            edit_message_text(chat_id, int(message_id), f"✅ OCR-аудит решен #{audit_id}\n{note}")
+    except Exception as exc:
+        safe_answer_callback(callback_id, "Ошибка")
+        send_admin_message(f"Ошибка OCR-аудита #{audit_id}\n\n{exc}")
+
+
+def resolve_audit_item(conn, *, audit_id: int, action: str, merge_player_id: int | None, user_id: str) -> str:
+    row = conn.execute(
+        """
+        SELECT pna.*, p.normalized_name
+        FROM player_name_audit pna
+        JOIN players p ON p.id = pna.player_id
+        WHERE pna.id = ?
+        """,
+        (audit_id,),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("audit item not found")
+    if row["status"] != "open":
+        return f"Уже обработано: {row['status']}"
+    player_id = int(row["player_id"])
+    name = str(row["display_name"])
+    now = now_text()
+    if action == "later":
+        conn.execute("UPDATE player_name_audit SET telegram_message_id=NULL WHERE id=?", (audit_id,))
+        conn.commit()
+        return "Отложено."
+    if action == "keep":
+        status = "kept"
+        note = "Оставлено как реальный игрок."
+    elif action == "delete":
+        mark_player_as_ocr_garbage(conn, player_id=player_id, audit_id=audit_id)
+        status = "deleted"
+        note = f"Помечено как OCR-мусор и убрано из участий: {name}"
+    elif action == "merge" and merge_player_id:
+        merge_player(conn, source_player_id=player_id, target_player_id=merge_player_id)
+        status = "merged"
+        note = f"Склеено: {name} -> player #{merge_player_id}"
+    else:
+        raise RuntimeError(f"unknown audit action: {action}")
+    conn.execute(
+        """
+        UPDATE player_name_audit
+        SET status=?,
+            resolved_at=?,
+            resolved_by_telegram_id=?,
+            resolution_note=?
+        WHERE id=?
+        """,
+        (status, now, user_id, note, audit_id),
+    )
+    conn.commit()
+    return note
+
+
+def mark_player_as_ocr_garbage(conn, *, player_id: int, audit_id: int) -> None:
+    key = f"ocr_garbage:{player_id}"
+    for table in ("current_participants", "final_participations"):
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET player_id = NULL,
+                participant_key = ?,
+                resolve_status = 'ocr_garbage'
+            WHERE player_id = ?
+            """,
+            (key, player_id),
+        )
+    conn.execute(
+        """
+        UPDATE pending_players
+        SET status='discarded',
+            resolution_note=COALESCE(resolution_note, ?) 
+        WHERE resolved_player_id = ? OR normalized_name = (
+            SELECT normalized_name FROM players WHERE id = ?
+        )
+        """,
+        (f"discarded by player audit #{audit_id}", player_id, player_id),
+    )
+    conn.execute("DELETE FROM player_aliases WHERE player_id = ?", (player_id,))
+    conn.execute("DELETE FROM players WHERE id = ?", (player_id,))
+
+
+def merge_player(conn, *, source_player_id: int, target_player_id: int) -> None:
+    if source_player_id == target_player_id:
+        raise RuntimeError("source and target are the same")
+    source = conn.execute("SELECT * FROM players WHERE id=?", (source_player_id,)).fetchone()
+    target = conn.execute("SELECT * FROM players WHERE id=?", (target_player_id,)).fetchone()
+    if not source or not target:
+        raise RuntimeError("source or target player not found")
+    for table in ("current_participants", "final_participations"):
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET player_id = ?,
+                participant_key = ?,
+                resolve_status = 'audit_merged'
+            WHERE player_id = ?
+            """,
+            (target_player_id, f"player:{target_player_id}", source_player_id),
+        )
+    conn.execute(
+        """
+        INSERT INTO player_aliases (player_id, alias_name, normalized_alias, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(normalized_alias) DO UPDATE SET player_id=excluded.player_id
+        """,
+        (target_player_id, source["display_name"], source["normalized_name"], now_text()),
+    )
+    conn.execute("DELETE FROM players WHERE id = ?", (source_player_id,))
 
 
 def handle_invite_document(conn, user_id: str, document: dict) -> None:
