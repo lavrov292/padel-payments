@@ -5,8 +5,15 @@ import argparse
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
+from invite_players import (
+    create_invite_job,
+    init_invite_db,
+    list_active_my_tournaments,
+    read_player_names_from_xlsx,
+)
 from storage import connect, init_db
 from telegram_alerts import (
     admin_chat_id,
@@ -18,6 +25,9 @@ from telegram_alerts import (
     telegram_get_updates,
     telegram_request,
 )
+
+
+INVITE_UPLOAD_STATE: dict[str, int] = {}
 
 
 def main() -> int:
@@ -36,6 +46,7 @@ def main() -> int:
 
     conn = connect(args.db)
     init_db(conn)
+    init_invite_db(conn)
     telegram_request("deleteWebhook", {"drop_pending_updates": False})
     offset: int | None = None
     print(f"Telegram admin bot started for admin {admin_chat_id()}", flush=True)
@@ -66,6 +77,14 @@ def handle_update(conn, update: dict) -> None:
     if text.startswith("/status"):
         rows = conn.execute("SELECT COUNT(*) FROM pending_players WHERE status = 'pending'").fetchone()[0]
         notify_cycle_problem(title="Lunda status", details=f"Pending names: {rows}")
+        return
+    if text.startswith("/invite"):
+        send_invite_tournament_picker(conn)
+        return
+
+    document = message.get("document") or {}
+    if document:
+        handle_invite_document(conn, str(user.get("id") or chat.get("id") or ""), document)
 
 
 def handle_callback(conn, callback: dict) -> None:
@@ -81,6 +100,18 @@ def handle_callback(conn, callback: dict) -> None:
         answer_callback(callback_id, "Недоступно")
         return
 
+    if data.startswith("lunda:invite:tournament:"):
+        tournament_id = int(data.rsplit(":", 1)[-1])
+        INVITE_UPLOAD_STATE[user_id] = tournament_id
+        answer_callback(callback_id, "Жду Excel")
+        if chat_id and message_id:
+            edit_message_text(
+                chat_id,
+                int(message_id),
+                f"✅ Турнир выбран: #{tournament_id}\nТеперь отправь Excel-файл с именами игроков в первом столбце.",
+            )
+        return
+
     parts = data.split(":")
     if len(parts) < 4 or parts[:2] != ["lunda", "pending"]:
         answer_callback(callback_id, "Неизвестная команда")
@@ -93,6 +124,82 @@ def handle_callback(conn, callback: dict) -> None:
     answer_callback(callback_id, "Готово")
     if chat_id and message_id:
         edit_message_text(chat_id, int(message_id), f"✅ Решено: pending #{pending_id}\n{note}")
+
+
+def send_invite_tournament_picker(conn) -> None:
+    rows = list_active_my_tournaments(conn, limit=30)
+    if not rows:
+        notify_cycle_problem(
+            title="Приглашения",
+            details="Пока нет сохраненных моих турниров. Сначала нужно запустить collect-my-tournaments.",
+        )
+        return
+    keyboard = []
+    lines = ["Выбери турнир для приглашений:"]
+    for row in rows:
+        label = f"{_short_datetime(row['starts_at'], row['time_label'])} | {row['location']} | {row['participants_label'] or ''}".strip()
+        lines.append(f"#{row['id']} {label}")
+        keyboard.append([{"text": label[:60], "callback_data": f"lunda:invite:tournament:{row['id']}"}])
+    telegram_request(
+        "sendMessage",
+        {
+            "chat_id": admin_chat_id(),
+            "text": "\n".join(lines),
+            "reply_markup": {"inline_keyboard": keyboard},
+            "disable_web_page_preview": True,
+        },
+    )
+
+
+def handle_invite_document(conn, user_id: str, document: dict) -> None:
+    tournament_id = INVITE_UPLOAD_STATE.get(user_id)
+    if not tournament_id:
+        return
+    file_name = str(document.get("file_name") or "")
+    if not file_name.lower().endswith((".xlsx", ".xlsm")):
+        notify_cycle_problem(title="Приглашения", details="Нужен Excel .xlsx/.xlsm с именами в первом столбце.")
+        return
+    file_id = str(document.get("file_id") or "")
+    try:
+        path = download_telegram_file(file_id, suffix=Path(file_name).suffix or ".xlsx")
+        names = read_player_names_from_xlsx(path)
+        if not names:
+            notify_cycle_problem(title="Приглашения", details="В Excel не нашел имен в первом столбце.")
+            return
+        job_id = create_invite_job(conn, my_tournament_id=tournament_id, player_names=names)
+        INVITE_UPLOAD_STATE.pop(user_id, None)
+        notify_cycle_problem(
+            title="Приглашения",
+            details=f"Создана задача #{job_id}. Игроков в файле: {len(names)}. Выполню ее отдельным invite-runner.",
+        )
+    except Exception as exc:
+        notify_cycle_problem(title="Приглашения: ошибка Excel", details=str(exc))
+
+
+def download_telegram_file(file_id: str, *, suffix: str = ".xlsx") -> Path:
+    info = telegram_request("getFile", {"file_id": file_id})
+    file_path = str((info.get("result") or {}).get("file_path") or "")
+    if not file_path:
+        raise RuntimeError("Telegram did not return file_path")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    out_dir = Path(os.environ.get("LUNDA_INVITE_UPLOAD_DIR", "/opt/lunda-collector/work/invite_uploads"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output = out_dir / f"invite_{int(time.time())}{suffix}"
+    urllib.request.urlretrieve(url, output)
+    return output
+
+
+def _short_datetime(starts_at: str, fallback_time: str) -> str:
+    if not starts_at:
+        return fallback_time
+    try:
+        from datetime import datetime
+
+        dt = datetime.fromisoformat(starts_at)
+    except ValueError:
+        return fallback_time
+    return dt.strftime("%d.%m %H:%M")
 
 
 def load_env_file(path: Path) -> None:
