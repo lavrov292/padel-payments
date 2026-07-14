@@ -111,6 +111,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS player_name_blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_name TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by_telegram_id TEXT,
+            note TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS pending_players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER,
@@ -443,7 +453,7 @@ def record_participant_snapshot(
     )
 
     seen_keys: set[str] = set()
-    stats = {"seen": len(participant_records), "resolved": 0, "pending": 0, "new": 0, "ratings_seen": 0}
+    stats = {"seen": len(participant_records), "resolved": 0, "pending": 0, "new": 0, "ratings_seen": 0, "blacklisted": 0}
 
     for record in participant_records:
         raw_name = record["name"]
@@ -457,6 +467,9 @@ def record_participant_snapshot(
             tournament_id=tournament_id,
             now_iso=observed_at,
         )
+        if resolution.status == "ocr_blacklisted":
+            stats["blacklisted"] += 1
+            continue
         participant_key = f"player:{resolution.player_id}" if resolution.player_id else f"pending:{resolution.normalized_name}"
         seen_keys.add(participant_key)
         if resolution.status == "new_player":

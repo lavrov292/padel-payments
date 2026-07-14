@@ -15,7 +15,13 @@ from invite_players import (
     list_active_my_tournaments,
     read_player_names_from_xlsx,
 )
-from player_audit import audit_item_candidates, init_player_audit_db, load_open_audit_items
+from player_audit import (
+    add_player_name_blacklist,
+    audit_item_candidates,
+    cleanup_blacklisted_players,
+    init_player_audit_db,
+    load_open_audit_items,
+)
 from storage import connect, init_db
 from telegram_alerts import (
     admin_chat_id,
@@ -82,8 +88,9 @@ def handle_update(conn, update: dict) -> None:
         notify_cycle_problem(title="Lunda status", details=f"Pending names: {rows}\nAudit names: {audit_rows}")
         return
     if text.startswith("/audit"):
+        removed = cleanup_blacklisted_players(conn)
         sent = notify_audit_items(conn)
-        notify_cycle_problem(title="Lunda audit", details=f"Audit messages sent: {sent}")
+        notify_cycle_problem(title="Lunda audit", details=f"Audit messages sent: {sent}\nBlacklisted removed: {removed}")
         return
     if text.startswith("/invite"):
         send_invite_tournament_picker(conn)
@@ -107,6 +114,20 @@ def init_invite_bot_db(conn) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             job_id INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_bot_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_ids_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            telegram_message_id INTEGER,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolved_by_telegram_id TEXT,
+            resolution_note TEXT
         )
         """
     )
@@ -171,6 +192,10 @@ def handle_callback(conn, callback: dict) -> None:
         handle_audit_callback(conn, callback_id=callback_id, user_id=user_id, chat_id=chat_id, message_id=message_id, data=data)
         return
 
+    if data.startswith("lunda:auditbulk:"):
+        handle_audit_bulk_callback(conn, callback_id=callback_id, user_id=user_id, chat_id=chat_id, message_id=message_id, data=data)
+        return
+
     parts = data.split(":")
     if len(parts) < 4 or parts[:2] != ["lunda", "pending"]:
         safe_answer_callback(callback_id, "Неизвестная команда")
@@ -219,8 +244,23 @@ def safe_answer_callback(callback_id: str, text: str = "") -> None:
 
 def notify_audit_items(conn, *, limit: int = 20) -> int:
     rows = load_open_audit_items(conn, limit=limit)
+    confident, review = split_audit_rows(rows)
     sent = 0
-    for row in rows:
+    if confident:
+        message_id = send_admin_message(
+            audit_bulk_message(confident),
+            reply_markup=audit_bulk_keyboard(conn, confident),
+        )
+        if message_id:
+            ids = [int(row["id"]) for row in confident]
+            conn.execute(
+                "UPDATE audit_bot_batches SET telegram_message_id=? WHERE id=(SELECT MAX(id) FROM audit_bot_batches)",
+                (message_id,),
+            )
+            for audit_id in ids:
+                conn.execute("UPDATE player_name_audit SET telegram_message_id = ? WHERE id = ?", (message_id, audit_id))
+            sent += 1
+    for row in review:
         message_id = send_admin_message(
             audit_message(conn, row),
             reply_markup=audit_keyboard(int(row["id"]), audit_item_candidates(conn, row)),
@@ -233,6 +273,62 @@ def notify_audit_items(conn, *, limit: int = 20) -> int:
             sent += 1
     conn.commit()
     return sent
+
+
+def split_audit_rows(rows) -> tuple[list, list]:
+    confident = []
+    review = []
+    for row in rows:
+        if audit_row_is_confident_garbage(row):
+            confident.append(row)
+        else:
+            review.append(row)
+    return confident, review
+
+
+def audit_row_is_confident_garbage(row) -> bool:
+    reasons = set(json.loads(row["heuristic_reasons"] or "[]"))
+    if reasons & {"known_ui_or_description_phrase", "normalized_known_bad_phrase", "too_many_words", "contains_digit"}:
+        return True
+    if "contains_connector_word_without_rating" in reasons and row["latest_rating"] is None:
+        return True
+    if "short_all_caps_without_rating" in reasons and row["latest_rating"] is None:
+        return True
+    return False
+
+
+def audit_bulk_message(rows) -> str:
+    lines = [
+        "🧹 OCR-аудит: похоже, это явный мусор",
+        "",
+        "Можно удалить пачкой:",
+    ]
+    for row in rows:
+        reasons = ", ".join(json.loads(row["heuristic_reasons"] or "[]"))
+        lines.append(f"- #{row['id']} / player {row['player_id']}: {row['display_name']} ({reasons})")
+    lines.append("")
+    lines.append("Удаление уберет эти имена из статистики игроков, а участия пометит как ocr_garbage.")
+    return "\n".join(lines)
+
+
+def audit_bulk_keyboard(conn, rows) -> dict:
+    item_ids = [int(row["id"]) for row in rows]
+    now = now_text()
+    conn.execute(
+        """
+        INSERT INTO audit_bot_batches (item_ids_json, status, created_at)
+        VALUES (?, 'open', ?)
+        """,
+        (json.dumps(item_ids), now),
+    )
+    batch_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    return {
+        "inline_keyboard": [
+            [{"text": f"🗑 Удалить все ({len(item_ids)})", "callback_data": f"lunda:auditbulk:{batch_id}:delete"}],
+            [{"text": "✅ Оставить все", "callback_data": f"lunda:auditbulk:{batch_id}:keep"}],
+            [{"text": "⏸ Потом", "callback_data": f"lunda:auditbulk:{batch_id}:later"}],
+        ]
+    }
 
 
 def audit_message(conn, row) -> str:
@@ -295,12 +391,76 @@ def handle_audit_callback(conn, *, callback_id: str, user_id: str, chat_id, mess
         send_admin_message(f"Ошибка OCR-аудита #{audit_id}\n\n{exc}")
 
 
+def handle_audit_bulk_callback(conn, *, callback_id: str, user_id: str, chat_id, message_id, data: str) -> None:
+    parts = data.split(":")
+    if len(parts) < 4:
+        safe_answer_callback(callback_id, "Не понял")
+        return
+    batch_id = int(parts[2])
+    action = parts[3]
+    row = conn.execute("SELECT * FROM audit_bot_batches WHERE id=?", (batch_id,)).fetchone()
+    if not row and message_id:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM audit_bot_batches
+            WHERE telegram_message_id = ?
+              AND status = 'open'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(message_id),),
+        ).fetchone()
+    if not row:
+        safe_answer_callback(callback_id, "Пачка не найдена")
+        return
+    batch_id = int(row["id"])
+    if row["status"] != "open":
+        safe_answer_callback(callback_id, "Уже обработано")
+        return
+    item_ids = json.loads(row["item_ids_json"] or "[]")
+    notes: list[str] = []
+    try:
+        if action == "later":
+            for audit_id in item_ids:
+                conn.execute("UPDATE player_name_audit SET telegram_message_id=NULL WHERE id=? AND status='open'", (audit_id,))
+            status = "later"
+            note = "Отложено."
+        elif action == "keep":
+            for audit_id in item_ids:
+                notes.append(resolve_audit_item(conn, audit_id=int(audit_id), action="keep", merge_player_id=None, user_id=user_id))
+            status = "kept"
+            note = f"Оставлено: {len(notes)}"
+        elif action == "delete":
+            for audit_id in item_ids:
+                notes.append(resolve_audit_item(conn, audit_id=int(audit_id), action="delete", merge_player_id=None, user_id=user_id))
+            status = "deleted"
+            note = f"Удалено: {len(notes)}"
+        else:
+            raise RuntimeError(f"unknown bulk action: {action}")
+        conn.execute(
+            """
+            UPDATE audit_bot_batches
+            SET status=?, resolved_at=?, resolved_by_telegram_id=?, resolution_note=?
+            WHERE id=?
+            """,
+            (status, now_text(), user_id, note, batch_id),
+        )
+        conn.commit()
+        safe_answer_callback(callback_id, "Готово")
+        if chat_id and message_id:
+            edit_message_text(chat_id, int(message_id), f"✅ OCR-аудит пачкой решен #{batch_id}\n{note}")
+    except Exception as exc:
+        safe_answer_callback(callback_id, "Ошибка")
+        send_admin_message(f"Ошибка OCR-аудита пачкой #{batch_id}\n\n{exc}")
+
+
 def resolve_audit_item(conn, *, audit_id: int, action: str, merge_player_id: int | None, user_id: str) -> str:
     row = conn.execute(
         """
         SELECT pna.*, p.normalized_name
         FROM player_name_audit pna
-        JOIN players p ON p.id = pna.player_id
+        LEFT JOIN players p ON p.id = pna.player_id
         WHERE pna.id = ?
         """,
         (audit_id,),
@@ -311,6 +471,20 @@ def resolve_audit_item(conn, *, audit_id: int, action: str, merge_player_id: int
         return f"Уже обработано: {row['status']}"
     player_id = int(row["player_id"])
     name = str(row["display_name"])
+    if row["normalized_name"] is None and action in {"delete", "merge"}:
+        conn.execute(
+            """
+            UPDATE player_name_audit
+            SET status='missing_player',
+                resolved_at=?,
+                resolved_by_telegram_id=?,
+                resolution_note='player row already missing'
+            WHERE id=?
+            """,
+            (now_text(), user_id, audit_id),
+        )
+        conn.commit()
+        return "Игрок уже отсутствует в базе."
     now = now_text()
     if action == "later":
         conn.execute("UPDATE player_name_audit SET telegram_message_id=NULL WHERE id=?", (audit_id,))
@@ -320,6 +494,14 @@ def resolve_audit_item(conn, *, audit_id: int, action: str, merge_player_id: int
         status = "kept"
         note = "Оставлено как реальный игрок."
     elif action == "delete":
+        add_player_name_blacklist(
+            conn,
+            display_name=name,
+            normalized_name=str(row["normalized_name"] or ""),
+            source="telegram_audit_delete",
+            created_by_telegram_id=user_id,
+            note=f"deleted by player audit #{audit_id}",
+        )
         mark_player_as_ocr_garbage(conn, player_id=player_id, audit_id=audit_id)
         status = "deleted"
         note = f"Помечено как OCR-мусор и убрано из участий: {name}"

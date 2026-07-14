@@ -16,7 +16,7 @@ from typing import Any
 
 from openpyxl import Workbook
 
-from player_matcher import find_candidate_players
+from player_matcher import find_candidate_players, normalize_name
 from storage import DEFAULT_DB_PATH, connect, init_db
 
 
@@ -92,6 +92,7 @@ def main() -> int:
     conn = connect(args.db)
     init_db(conn)
     init_player_audit_db(conn)
+    blacklisted_removed = cleanup_blacklisted_players(conn)
 
     rows = load_player_rows(conn)
     audited = [audit_player(row) for row in rows]
@@ -109,12 +110,26 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_xlsx(selected, out_path)
     print(f"Audited players: {len(audited)}")
+    print(f"Blacklisted players removed: {blacklisted_removed}")
     print(f"Rows exported: {len(selected)}")
     print(f"Output: {out_path}")
     return 0
 
 
 def init_player_audit_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_name_blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_name TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by_telegram_id TEXT,
+            note TEXT
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS player_name_audit (
@@ -141,6 +156,86 @@ def init_player_audit_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "player_name_audit", "resolved_by_telegram_id", "TEXT")
     ensure_column(conn, "player_name_audit", "resolution_note", "TEXT")
     conn.commit()
+
+
+def add_player_name_blacklist(
+    conn: sqlite3.Connection,
+    *,
+    display_name: str,
+    normalized_name: str = "",
+    source: str,
+    created_by_telegram_id: str | None = None,
+    note: str | None = None,
+) -> str:
+    normalized = (normalized_name or normalize_name(display_name)).strip()
+    if not normalized:
+        return ""
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO player_name_blacklist (
+            normalized_name, display_name, source, created_at, created_by_telegram_id, note
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_name) DO UPDATE SET
+            display_name = excluded.display_name,
+            source = excluded.source,
+            created_by_telegram_id = COALESCE(excluded.created_by_telegram_id, player_name_blacklist.created_by_telegram_id),
+            note = COALESCE(excluded.note, player_name_blacklist.note)
+        """,
+        (normalized, display_name.strip() or normalized, source, created_at, created_by_telegram_id, note),
+    )
+    return normalized
+
+
+def cleanup_blacklisted_players(conn: sqlite3.Connection) -> int:
+    init_player_audit_db(conn)
+    rows = conn.execute(
+        """
+        SELECT p.id, p.display_name, p.normalized_name
+        FROM players p
+        JOIN player_name_blacklist b ON b.normalized_name = p.normalized_name
+        """
+    ).fetchall()
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for row in rows:
+        player_id = int(row["id"])
+        normalized = str(row["normalized_name"] or "")
+        key = f"ocr_blacklist:{player_id}"
+        for table in ("current_participants", "final_participations"):
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET player_id = NULL,
+                    participant_key = ?,
+                    resolve_status = 'ocr_blacklisted'
+                WHERE player_id = ?
+                """,
+                (key, player_id),
+            )
+        conn.execute(
+            """
+            UPDATE pending_players
+            SET status='discarded',
+                resolution_note=COALESCE(resolution_note, 'discarded by OCR blacklist')
+            WHERE resolved_player_id = ? OR normalized_name = ?
+            """,
+            (player_id, normalized),
+        )
+        conn.execute("DELETE FROM player_aliases WHERE player_id = ?", (player_id,))
+        conn.execute("DELETE FROM players WHERE id = ?", (player_id,))
+        conn.execute(
+            """
+            UPDATE player_name_audit
+            SET status='deleted',
+                resolved_at=COALESCE(resolved_at, ?),
+                resolution_note=COALESCE(resolution_note, 'deleted by OCR blacklist')
+            WHERE player_id = ? AND status = 'open'
+            """,
+            (now, player_id),
+        )
+    conn.commit()
+    return len(rows)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -234,6 +329,8 @@ def is_confident_garbage(row: PlayerAuditRow) -> bool:
     if any(reason in strong for reason in row.reasons):
         return True
     if "contains_connector_word_without_rating" in row.reasons and row.latest_rating is None:
+        return True
+    if "short_all_caps_without_rating" in row.reasons and row.latest_rating is None:
         return True
     return False
 

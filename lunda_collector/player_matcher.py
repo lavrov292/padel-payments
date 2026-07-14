@@ -59,6 +59,8 @@ def resolve_player(
     normalized = normalize_name(raw_name)
     if not normalized:
         return PlayerResolution(None, "empty", "", [])
+    if is_blacklisted_name(conn, normalized):
+        return PlayerResolution(None, "ocr_blacklisted", normalized, [])
 
     now_iso = now_iso or datetime.now().isoformat(timespec="seconds")
 
@@ -200,6 +202,24 @@ def find_candidate_players(
 
     pool.sort(key=lambda item: (item.score, item.dist, item.name))
     return pool[: min(limit, pool_limit)]
+
+
+def is_blacklisted_name(conn: sqlite3.Connection, normalized_name: str) -> bool:
+    if not normalized_name:
+        return False
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM player_name_blacklist
+            WHERE normalized_name = ?
+            LIMIT 1
+            """,
+            (normalized_name,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
 
 
 def levenshtein_threshold(normalized_name_len: int) -> int:
