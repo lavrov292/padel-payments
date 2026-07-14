@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -21,13 +22,11 @@ from telegram_alerts import (
     edit_message_text,
     notify_cycle_problem,
     resolve_pending,
+    send_admin_message,
     telegram_configured,
     telegram_get_updates,
     telegram_request,
 )
-
-
-INVITE_UPLOAD_STATE: dict[str, int] = {}
 
 
 def main() -> int:
@@ -47,6 +46,7 @@ def main() -> int:
     conn = connect(args.db)
     init_db(conn)
     init_invite_db(conn)
+    init_invite_bot_db(conn)
     telegram_request("deleteWebhook", {"drop_pending_updates": False})
     offset: int | None = None
     print(f"Telegram admin bot started for admin {admin_chat_id()}", flush=True)
@@ -87,6 +87,25 @@ def handle_update(conn, update: dict) -> None:
         handle_invite_document(conn, str(user.get("id") or chat.get("id") or ""), document)
 
 
+def init_invite_bot_db(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invite_bot_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            my_tournament_id INTEGER NOT NULL,
+            upload_path TEXT,
+            names_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'waiting_file',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            job_id INTEGER
+        )
+        """
+    )
+    conn.commit()
+
+
 def handle_callback(conn, callback: dict) -> None:
     user = callback.get("from") or {}
     user_id = str(user.get("id") or "")
@@ -102,14 +121,56 @@ def handle_callback(conn, callback: dict) -> None:
 
     if data.startswith("lunda:invite:tournament:"):
         tournament_id = int(data.rsplit(":", 1)[-1])
-        INVITE_UPLOAD_STATE[user_id] = tournament_id
+        session_id = create_invite_session(conn, user_id=user_id, tournament_id=tournament_id)
         answer_callback(callback_id, "Жду Excel")
+        tournament_label = invite_tournament_label(conn, tournament_id)
         if chat_id and message_id:
             edit_message_text(
                 chat_id,
                 int(message_id),
-                f"✅ Турнир выбран: #{tournament_id}\nТеперь отправь Excel-файл с именами игроков в первом столбце.",
+                f"✅ Турнир выбран\n{tournament_label}\n\nТеперь отправь Excel-файл с именами игроков в первом столбце.",
             )
+        else:
+            send_admin_message(
+                f"✅ Турнир выбран\n{tournament_label}\n\nТеперь отправь Excel-файл с именами игроков в первом столбце."
+            )
+        print(f"invite session {session_id}: tournament {tournament_id} selected", flush=True)
+        return
+
+    if data.startswith("lunda:invite:start:"):
+        session_id = int(data.rsplit(":", 1)[-1])
+        session = get_invite_session(conn, session_id=session_id, user_id=user_id)
+        if not session or session["status"] != "ready":
+            answer_callback(callback_id, "Задача уже неактуальна")
+            return
+        names = json.loads(session["names_json"] or "[]")
+        job_id = create_invite_job(conn, my_tournament_id=int(session["my_tournament_id"]), player_names=names)
+        conn.execute(
+            "UPDATE invite_bot_sessions SET status='queued', job_id=?, updated_at=? WHERE id=?",
+            (job_id, now_text(), session_id),
+        )
+        conn.commit()
+        answer_callback(callback_id, "Запускаю")
+        text = f"✅ Хорошо, задача #{job_id} создана.\nИгроков: {len(names)}.\nПриглашения идут."
+        if chat_id and message_id:
+            edit_message_text(chat_id, int(message_id), text)
+        else:
+            send_admin_message(text)
+        print(f"invite session {session_id}: job {job_id} queued", flush=True)
+        return
+
+    if data.startswith("lunda:invite:cancel:"):
+        session_id = int(data.rsplit(":", 1)[-1])
+        conn.execute(
+            "UPDATE invite_bot_sessions SET status='cancelled', updated_at=? WHERE id=? AND user_id=?",
+            (now_text(), session_id, user_id),
+        )
+        conn.commit()
+        answer_callback(callback_id, "Отменено")
+        if chat_id and message_id:
+            edit_message_text(chat_id, int(message_id), "❌ Приглашение отменено.")
+        else:
+            send_admin_message("❌ Приглашение отменено.")
         return
 
     parts = data.split(":")
@@ -152,28 +213,103 @@ def send_invite_tournament_picker(conn) -> None:
 
 
 def handle_invite_document(conn, user_id: str, document: dict) -> None:
-    tournament_id = INVITE_UPLOAD_STATE.get(user_id)
-    if not tournament_id:
+    session = latest_waiting_invite_session(conn, user_id=user_id)
+    if not session:
+        send_admin_message("Сначала выбери турнир через /invite, потом отправь Excel-файл.")
         return
+    tournament_id = int(session["my_tournament_id"])
     file_name = str(document.get("file_name") or "")
     if not file_name.lower().endswith((".xlsx", ".xlsm")):
-        notify_cycle_problem(title="Приглашения", details="Нужен Excel .xlsx/.xlsm с именами в первом столбце.")
+        send_admin_message("Нужен Excel .xlsx/.xlsm с именами в первом столбце.")
         return
     file_id = str(document.get("file_id") or "")
     try:
         path = download_telegram_file(file_id, suffix=Path(file_name).suffix or ".xlsx")
         names = read_player_names_from_xlsx(path)
         if not names:
-            notify_cycle_problem(title="Приглашения", details="В Excel не нашел имен в первом столбце.")
+            send_admin_message("В Excel не нашел имен в первом столбце.")
             return
-        job_id = create_invite_job(conn, my_tournament_id=tournament_id, player_names=names)
-        INVITE_UPLOAD_STATE.pop(user_id, None)
-        notify_cycle_problem(
-            title="Приглашения",
-            details=f"Создана задача #{job_id}. Игроков в файле: {len(names)}. Выполню ее отдельным invite-runner.",
+        conn.execute(
+            """
+            UPDATE invite_bot_sessions
+            SET upload_path=?, names_json=?, status='ready', updated_at=?
+            WHERE id=?
+            """,
+            (str(path), json.dumps(names, ensure_ascii=False), now_text(), session["id"]),
         )
+        conn.commit()
+        send_admin_message(
+            invite_confirmation_message(conn, tournament_id=tournament_id, names=names),
+            reply_markup={
+                "inline_keyboard": [
+                    [{"text": "▶️ Начать отправку приглашений", "callback_data": f"lunda:invite:start:{session['id']}"}],
+                    [{"text": "❌ Отмена", "callback_data": f"lunda:invite:cancel:{session['id']}"}],
+                ]
+            },
+        )
+        print(f"invite session {session['id']}: excel received; names={len(names)}", flush=True)
     except Exception as exc:
-        notify_cycle_problem(title="Приглашения: ошибка Excel", details=str(exc))
+        send_admin_message(f"Приглашения: ошибка Excel\n\n{exc}")
+
+
+def create_invite_session(conn, *, user_id: str, tournament_id: int) -> int:
+    now = now_text()
+    conn.execute(
+        "UPDATE invite_bot_sessions SET status='cancelled', updated_at=? WHERE user_id=? AND status IN ('waiting_file', 'ready')",
+        (now, user_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO invite_bot_sessions (user_id, my_tournament_id, status, created_at, updated_at)
+        VALUES (?, ?, 'waiting_file', ?, ?)
+        """,
+        (user_id, tournament_id, now, now),
+    )
+    conn.commit()
+    return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def latest_waiting_invite_session(conn, *, user_id: str):
+    return conn.execute(
+        """
+        SELECT *
+        FROM invite_bot_sessions
+        WHERE user_id = ? AND status = 'waiting_file'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+def get_invite_session(conn, *, session_id: int, user_id: str):
+    return conn.execute(
+        "SELECT * FROM invite_bot_sessions WHERE id = ? AND user_id = ?",
+        (session_id, user_id),
+    ).fetchone()
+
+
+def invite_confirmation_message(conn, *, tournament_id: int, names: list[str]) -> str:
+    preview = "\n".join(f"• {name}" for name in names[:10])
+    if len(names) > 10:
+        preview += f"\n…и еще {len(names) - 10}"
+    return (
+        "Excel получил.\n\n"
+        f"Турнир:\n{invite_tournament_label(conn, tournament_id)}\n\n"
+        f"Игроков в файле: {len(names)}\n"
+        f"{preview}\n\n"
+        "Начать отправку приглашений?"
+    )
+
+
+def invite_tournament_label(conn, tournament_id: int) -> str:
+    row = conn.execute("SELECT * FROM my_tournaments WHERE id = ?", (tournament_id,)).fetchone()
+    if not row:
+        return f"#{tournament_id}"
+    return (
+        f"#{row['id']} {_short_datetime(row['starts_at'], row['time_label'])} | "
+        f"{row['location']} | {row['participants_label'] or ''}"
+    ).strip()
 
 
 def download_telegram_file(file_id: str, *, suffix: str = ".xlsx") -> Path:
@@ -200,6 +336,10 @@ def _short_datetime(starts_at: str, fallback_time: str) -> str:
     except ValueError:
         return fallback_time
     return dt.strftime("%d.%m %H:%M")
+
+
+def now_text() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def load_env_file(path: Path) -> None:
