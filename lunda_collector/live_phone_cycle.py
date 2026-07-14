@@ -625,7 +625,7 @@ def guarded_back_to_list(ctx: LiveContext, *, max_actions: int = 4) -> bool:
             tap_lunda_bottom_nav(ctx, "играть")
             time.sleep(1.5)
             continue
-        if screen in {"participants", "tournament_detail", "tournament_missing"}:
+        if screen in {"participants", "tournament_detail", "tournament_missing", "invite_players"}:
             ctx.android.go_back()
             time.sleep(1.5)
             continue
@@ -695,7 +695,7 @@ def ensure_tournament_list(ctx: LiveContext, *, refresh: bool = False) -> bool:
         return True
     if screen == "tournament_missing":
         return reset_from_missing_tournament(ctx)
-    if screen in {"participants", "tournament_detail"}:
+    if screen in {"participants", "tournament_detail", "invite_players"}:
         if not guarded_back_to_list(ctx):
             return recover_to_tournament_list(ctx)
         if refresh:

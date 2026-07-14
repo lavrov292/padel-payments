@@ -19,6 +19,9 @@ def detect_screen(text: str) -> str:
     if "турнир не найден" in lower:
         return "tournament_missing"
 
+    if "пригласить игроков" in lower and ("найти игрока" in lower or "только мои напарники" in lower):
+        return "invite_players"
+
     if "игры/турниры" in lower and ("тренировки" in lower or "утро" in lower or "вечер" in lower):
         return "tournament_list"
 

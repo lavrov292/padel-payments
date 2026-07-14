@@ -248,8 +248,11 @@ def collect_my_tournaments(conn, ctx: LiveContext, *, screens: int, scroll_pixel
     return merged
 
 
-def open_my_events_screen(ctx: LiveContext) -> bool:
-    if not ensure_home_screen(ctx):
+def open_my_events_screen(ctx: LiveContext, *, force_home: bool = False) -> bool:
+    if force_home:
+        if not ensure_main_home_screen(ctx):
+            return False
+    elif not ensure_home_screen(ctx):
         return False
     for attempt in range(3):
         captured = ctx.capture(f"open_my_events_{attempt + 1}")
@@ -269,13 +272,33 @@ def open_my_events_screen(ctx: LiveContext) -> bool:
     return bool(captured and is_my_events_screen(captured[1]))
 
 
+def ensure_main_home_screen(ctx: LiveContext) -> bool:
+    for _ in range(8):
+        captured = ctx.capture("ensure_main_home_for_invites")
+        if not captured:
+            continue
+        _, text, _ = captured
+        lower = text.lower()
+        if "ваш город" in lower and has_my_events_header(lower):
+            return True
+        if "главная" in lower and "играть" in lower:
+            tap_lunda_bottom_nav(ctx, "главная")
+            time.sleep(2.0)
+            continue
+        ctx.android.go_back()
+        time.sleep(1.0)
+    return False
+
+
 def ensure_home_screen(ctx: LiveContext) -> bool:
-    for _ in range(5):
+    for _ in range(8):
         captured = ctx.capture("ensure_home_for_invites")
         if not captured:
             continue
         _, text, _ = captured
         lower = text.lower()
+        if is_my_events_screen(text):
+            return True
         if "ваш город" in lower and has_my_events_header(lower):
             return True
         if "главная" in lower and "играть" in lower:
@@ -306,7 +329,7 @@ def parse_my_tournament_cards(ocr_result: dict[str, Any]) -> list[MyTournament]:
             continue
         location_line = _next_line(lines, idx, lambda value: "|" in value or "padel" in value.lower() or "падел" in value.lower())
         participants_line = _next_line(lines, idx, lambda value: bool(re.search(r"\d+\s*/\s*\d+\s+(?:игрок|команд)", value.lower())))
-        if not location_line:
+        if not location_line or not participants_line:
             continue
         location = cleanup_my_event_location(join_wrapped_location(lines, location_line))
         parsed = parse_tournament_datetime(date_label, time_label)
@@ -499,12 +522,13 @@ def run_invite_job(conn, ctx: LiveContext, *, job_id: int) -> int:
 
 
 def open_my_tournament_detail(ctx: LiveContext, tournament_row) -> bool:
-    if not open_my_events_screen(ctx):
+    if not open_my_events_screen(ctx, force_home=True):
         return False
-    scroll_my_events_to_top(ctx)
     target_key = str(tournament_row["identity_key"])
     target_starts_at = str(tournament_row["starts_at"] or "")
     target_location = normalize_invite_location(str(tournament_row["location"] or ""))
+    _, height = get_screen_size(ctx)
+    min_card_y = int(height * 0.55)
     for _ in range(20):
         captured = ctx.capture("find_my_tournament")
         if not captured:
@@ -512,6 +536,8 @@ def open_my_tournament_detail(ctx: LiveContext, tournament_row) -> bool:
         ocr_result, _, _ = captured
         cards = parse_my_tournament_cards(ocr_result)
         for card in cards:
+            if card.tap_y < min_card_y:
+                continue
             if card.identity_key == target_key or (
                 card.starts_at == target_starts_at
                 and normalize_invite_location(card.location) == target_location
@@ -519,7 +545,7 @@ def open_my_tournament_detail(ctx: LiveContext, tournament_row) -> bool:
                 ctx.android.tap(card.tap_x, card.tap_y)
                 time.sleep(2.0)
                 return True
-        ctx.android.scroll_down(pixels=620)
+        scroll_my_events_list_down(ctx, pixels=620)
         time.sleep(1.0)
     return False
 
@@ -528,6 +554,34 @@ def scroll_my_events_to_top(ctx: LiveContext) -> None:
     for _ in range(5):
         ctx.android.scroll_down(pixels=-850)
         time.sleep(0.6)
+
+
+def scroll_my_events_list_down(ctx: LiveContext, *, pixels: int = 620) -> bool:
+    width, height = get_screen_size(ctx)
+    start_y = int(height * 0.88)
+    end_y = max(int(height * 0.56), start_y - pixels)
+    adb_path = getattr(ctx.android, "adb_path", "adb")
+    device_id = getattr(ctx.android, "device_id", "") or select_adb_device()
+    result = subprocess.run(
+        [
+            adb_path,
+            "-s",
+            device_id,
+            "shell",
+            "input",
+            "swipe",
+            str(width // 2),
+            str(start_y),
+            str(width // 2),
+            str(end_y),
+            "650",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    time.sleep(0.5)
+    return result.returncode == 0
 
 
 def normalize_invite_location(value: str) -> str:
@@ -627,11 +681,21 @@ def select_search_results(ctx: LiveContext) -> int:
     result_lines = candidate_player_result_lines(lines)
     selected = 0
     width, _ = get_screen_size(ctx)
-    for line in result_lines:
-        ctx.android.tap(width // 2, (line.y_min + line.y_max) // 2)
+    for y in candidate_player_result_tap_ys(result_lines):
+        ctx.android.tap(width // 2, y)
         selected += 1
         time.sleep(0.4)
     return selected
+
+
+def candidate_player_result_tap_ys(lines: list[OCRLine]) -> list[int]:
+    tap_ys: list[int] = []
+    for line in sorted(lines, key=lambda item: (item.y_min + item.y_max) // 2):
+        y = (line.y_min + line.y_max) // 2
+        if tap_ys and y - tap_ys[-1] < 90:
+            continue
+        tap_ys.append(y)
+    return tap_ys
 
 
 def candidate_player_result_lines(lines: list[OCRLine]) -> list[OCRLine]:
