@@ -116,13 +116,13 @@ def handle_callback(conn, callback: dict) -> None:
     data = str(callback.get("data") or "")
 
     if user_id != str(admin_chat_id()):
-        answer_callback(callback_id, "Недоступно")
+        safe_answer_callback(callback_id, "Недоступно")
         return
 
     if data.startswith("lunda:invite:tournament:"):
         tournament_id = int(data.rsplit(":", 1)[-1])
         session_id = create_invite_session(conn, user_id=user_id, tournament_id=tournament_id)
-        answer_callback(callback_id, "Жду Excel")
+        safe_answer_callback(callback_id, "Жду Excel")
         tournament_label = invite_tournament_label(conn, tournament_id)
         send_admin_message(
             f"✅ Турнир выбран\n{tournament_label}\n\nТеперь отправь Excel-файл с именами игроков в первом столбце."
@@ -134,7 +134,7 @@ def handle_callback(conn, callback: dict) -> None:
         session_id = int(data.rsplit(":", 1)[-1])
         session = get_invite_session(conn, session_id=session_id, user_id=user_id)
         if not session or session["status"] != "ready":
-            answer_callback(callback_id, "Задача уже неактуальна")
+            safe_answer_callback(callback_id, "Задача уже неактуальна")
             return
         names = json.loads(session["names_json"] or "[]")
         job_id = create_invite_job(conn, my_tournament_id=int(session["my_tournament_id"]), player_names=names)
@@ -143,8 +143,8 @@ def handle_callback(conn, callback: dict) -> None:
             (job_id, now_text(), session_id),
         )
         conn.commit()
-        answer_callback(callback_id, "Запускаю")
-        text = f"✅ Хорошо, принял.\nЗадача #{job_id} в очереди.\nИгроков: {len(names)}."
+        safe_answer_callback(callback_id, "В очереди")
+        text = f"✅ Хорошо, принял.\nЗадача #{job_id} в очереди.\nИгроков: {len(names)}.\nОтправка начнется в 23:30."
         send_admin_message(text)
         print(f"invite session {session_id}: job {job_id} queued", flush=True)
         return
@@ -156,20 +156,20 @@ def handle_callback(conn, callback: dict) -> None:
             (now_text(), session_id, user_id),
         )
         conn.commit()
-        answer_callback(callback_id, "Отменено")
+        safe_answer_callback(callback_id, "Отменено")
         send_admin_message("❌ Приглашение отменено.")
         return
 
     parts = data.split(":")
     if len(parts) < 4 or parts[:2] != ["lunda", "pending"]:
-        answer_callback(callback_id, "Неизвестная команда")
+        safe_answer_callback(callback_id, "Неизвестная команда")
         return
 
     pending_id = int(parts[2])
     action = parts[3]
     player_id = int(parts[4]) if action == "player" and len(parts) > 4 else None
     note = resolve_pending(conn, pending_id=pending_id, action=action, player_id=player_id, resolved_by=user_id)
-    answer_callback(callback_id, "Готово")
+    safe_answer_callback(callback_id, "Готово")
     if chat_id and message_id:
         edit_message_text(chat_id, int(message_id), f"✅ Решено: pending #{pending_id}\n{note}")
 
@@ -197,6 +197,13 @@ def send_invite_tournament_picker(conn) -> None:
             "disable_web_page_preview": True,
         },
     )
+
+
+def safe_answer_callback(callback_id: str, text: str = "") -> None:
+    try:
+        answer_callback(callback_id, text)
+    except Exception as exc:
+        print(f"telegram answerCallbackQuery failed: {exc}", file=sys.stderr, flush=True)
 
 
 def handle_invite_document(conn, user_id: str, document: dict) -> None:

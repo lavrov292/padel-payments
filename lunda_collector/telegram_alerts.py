@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from urllib.error import HTTPError
 from datetime import datetime
 from typing import Any
 
@@ -80,8 +81,12 @@ def telegram_request(method: str, payload: dict[str, Any]) -> dict[str, Any]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        parsed = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram API HTTP {exc.code}: {body}") from exc
     if not parsed.get("ok"):
         raise RuntimeError(f"Telegram API error: {parsed}")
     return parsed
