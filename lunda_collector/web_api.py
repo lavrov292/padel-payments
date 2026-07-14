@@ -378,8 +378,9 @@ def players(
                 t.starts_at
             FROM final_participations fp
             JOIN tournaments t ON t.id = fp.tournament_id
-            LEFT JOIN players p ON p.id = fp.player_id
+            JOIN players p ON p.id = fp.player_id
             {where_sql}
+              {"AND" if where_sql else "WHERE"} fp.resolve_status NOT IN ('ocr_garbage', 'ocr_blacklisted', 'ocr_name_fragment')
             ORDER BY player_name, t.starts_at
             """,
             params,

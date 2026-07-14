@@ -735,13 +735,15 @@ def player_rankings(
     if format_value:
         filters.append("LOWER(t.format) LIKE ?")
         params.append(f"%{format_value.lower()}%")
+    filters.append("fp.player_id IS NOT NULL")
+    filters.append("fp.resolve_status NOT IN ('ocr_garbage', 'ocr_blacklisted', 'ocr_name_fragment')")
 
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
     params.append(limit)
     return conn.execute(
         f"""
         SELECT
-            COALESCE(p.display_name, fp.raw_name) AS player_name,
+            p.display_name AS player_name,
             fp.normalized_name,
             MAX(p.latest_rating) AS latest_rating,
             COUNT(*) AS tournament_count,
@@ -750,9 +752,9 @@ def player_rankings(
             GROUP_CONCAT(DISTINCT t.skill_level) AS levels
         FROM final_participations fp
         JOIN tournaments t ON t.id = fp.tournament_id
-        LEFT JOIN players p ON p.id = fp.player_id
+        JOIN players p ON p.id = fp.player_id
         {where_sql}
-        GROUP BY COALESCE(fp.player_id, fp.participant_key), fp.normalized_name
+        GROUP BY fp.player_id, fp.normalized_name
         ORDER BY tournament_count DESC, player_name ASC
         LIMIT ?
         """,

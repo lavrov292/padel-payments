@@ -34,6 +34,7 @@ BAD_PHRASES = {
     "мойки",
     "акваматик",
     "парковка",
+    "полезный перекус",
     "пригласить",
     "призеры",
     "призерам",
@@ -190,6 +191,43 @@ def add_player_name_blacklist(
 
 def cleanup_blacklisted_players(conn: sqlite3.Connection) -> int:
     init_player_audit_db(conn)
+    blacklist_rows = conn.execute(
+        """
+        SELECT normalized_name, display_name
+        FROM player_name_blacklist
+        """
+    ).fetchall()
+    for row in blacklist_rows:
+        normalized = str(row["normalized_name"] or "")
+        display = str(row["display_name"] or normalized)
+        if not normalized:
+            continue
+        key = f"ocr_blacklist:{normalized}"
+        for table in ("current_participants", "final_participations"):
+            active_sql = ", active = 0" if table == "current_participants" else ""
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET player_id = NULL,
+                    participant_key = ?,
+                    resolve_status = 'ocr_blacklisted'
+                    {active_sql}
+                WHERE normalized_name = ?
+                   OR lower(raw_name) = lower(?)
+                """,
+                (key, normalized, display),
+            )
+        conn.execute(
+            """
+            UPDATE pending_players
+            SET status='discarded',
+                resolution_note=COALESCE(resolution_note, 'discarded by OCR blacklist')
+            WHERE normalized_name = ?
+               OR lower(raw_name) = lower(?)
+            """,
+            (normalized, display),
+        )
+
     rows = conn.execute(
         """
         SELECT p.id, p.display_name, p.normalized_name
@@ -203,12 +241,14 @@ def cleanup_blacklisted_players(conn: sqlite3.Connection) -> int:
         normalized = str(row["normalized_name"] or "")
         key = f"ocr_blacklist:{player_id}"
         for table in ("current_participants", "final_participations"):
+            active_sql = ", active = 0" if table == "current_participants" else ""
             conn.execute(
                 f"""
                 UPDATE {table}
                 SET player_id = NULL,
                     participant_key = ?,
                     resolve_status = 'ocr_blacklisted'
+                    {active_sql}
                 WHERE player_id = ?
                 """,
                 (key, player_id),

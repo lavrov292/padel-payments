@@ -115,6 +115,7 @@ def export_workbook(
         FROM final_participations fp
         JOIN tournaments t ON t.id = fp.tournament_id
         LEFT JOIN players p ON p.id = fp.player_id
+        WHERE fp.resolve_status NOT IN ('ocr_garbage', 'ocr_blacklisted', 'ocr_name_fragment')
         ORDER BY t.starts_at, t.organizer, t.title, player_name
         """
     ).fetchall()
