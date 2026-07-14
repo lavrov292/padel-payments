@@ -450,6 +450,7 @@ def split_compact(value: str, *, limit: int = 8) -> list[str]:
 
 def save_audit_results(conn: sqlite3.Connection, rows: list[PlayerAuditRow], created_at: str) -> None:
     for row in rows:
+        reasons_json = json.dumps(row.reasons, ensure_ascii=False)
         existing = conn.execute(
             """
             SELECT id
@@ -476,7 +477,7 @@ def save_audit_results(conn: sqlite3.Connection, rows: list[PlayerAuditRow], cre
                 (
                     row.name,
                     row.heuristic_status,
-                    json.dumps(row.reasons, ensure_ascii=False),
+                    reasons_json,
                     row.llm_status,
                     row.llm_confidence,
                     row.llm_reason,
@@ -484,6 +485,20 @@ def save_audit_results(conn: sqlite3.Connection, rows: list[PlayerAuditRow], cre
                     int(existing["id"]),
                 ),
             )
+            continue
+        resolved = conn.execute(
+            """
+            SELECT id
+            FROM player_name_audit
+            WHERE player_id = ?
+              AND status = 'kept'
+              AND heuristic_reasons = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (row.player_id, reasons_json),
+        ).fetchone()
+        if resolved:
             continue
         conn.execute(
             """
@@ -498,7 +513,7 @@ def save_audit_results(conn: sqlite3.Connection, rows: list[PlayerAuditRow], cre
                 row.player_id,
                 row.name,
                 row.heuristic_status,
-                json.dumps(row.reasons, ensure_ascii=False),
+                reasons_json,
                 row.llm_status,
                 row.llm_confidence,
                 row.llm_reason,
