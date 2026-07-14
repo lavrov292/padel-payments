@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -475,7 +476,7 @@ def run_invite_job(conn, ctx: LiveContext, *, job_id: int) -> int:
             result = invite_one_player(ctx, str(name))
             stats[result] = stats.get(result, 0) + 1
             log_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
-        if not tap_final_invite_button(ctx):
+        if stats["selected"] > 0 and not tap_final_invite_button(ctx):
             raise RuntimeError("final invite button was not tapped")
         conn.execute(
             "UPDATE invite_jobs SET status='done', finished_at=?, stats_json=? WHERE id=?",
@@ -498,7 +499,10 @@ def run_invite_job(conn, ctx: LiveContext, *, job_id: int) -> int:
 def open_my_tournament_detail(ctx: LiveContext, tournament_row) -> bool:
     if not open_my_events_screen(ctx):
         return False
+    scroll_my_events_to_top(ctx)
     target_key = str(tournament_row["identity_key"])
+    target_starts_at = str(tournament_row["starts_at"] or "")
+    target_location = normalize_invite_location(str(tournament_row["location"] or ""))
     for _ in range(20):
         captured = ctx.capture("find_my_tournament")
         if not captured:
@@ -506,13 +510,28 @@ def open_my_tournament_detail(ctx: LiveContext, tournament_row) -> bool:
         ocr_result, _, _ = captured
         cards = parse_my_tournament_cards(ocr_result)
         for card in cards:
-            if card.identity_key == target_key:
+            if card.identity_key == target_key or (
+                card.starts_at == target_starts_at
+                and normalize_invite_location(card.location) == target_location
+            ):
                 ctx.android.tap(card.tap_x, card.tap_y)
                 time.sleep(2.0)
                 return True
         ctx.android.scroll_down(pixels=620)
         time.sleep(1.0)
     return False
+
+
+def scroll_my_events_to_top(ctx: LiveContext) -> None:
+    for _ in range(5):
+        ctx.android.scroll_down(pixels=-850)
+        time.sleep(0.6)
+
+
+def normalize_invite_location(value: str) -> str:
+    normalized = value.lower().replace("санкт- петербург", "санкт-петербург")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def open_invite_screen(ctx: LiveContext) -> bool:
@@ -542,18 +561,19 @@ def disable_only_partners(ctx: LiveContext) -> None:
     captured = ctx.capture("invite_toggle_check")
     if not captured:
         return
-    _, text, _ = captured
+    ocr_result, text, _ = captured
     if "игроки в других городах" in text.lower():
         return
+    coords = find_line_center(ocr_result, "только мои напарники")
     width, height = get_screen_size(ctx)
-    ctx.android.tap(int(width * 0.90), int(height * 0.255))
+    tap_y = coords["y"] if coords else int(height * 0.335)
+    ctx.android.tap(int(width * 0.90), tap_y)
     time.sleep(1.5)
 
 
 def invite_one_player(ctx: LiveContext, name: str) -> str:
     if not focus_search_field(ctx):
         return "errors"
-    clear_search_field(ctx)
     send_unicode_text(ctx, name)
     time.sleep(2.0)
     selected = select_search_results(ctx)
@@ -567,18 +587,27 @@ def focus_search_field(ctx: LiveContext) -> bool:
         return False
     ocr_result, _, _ = captured
     coords = find_line_center(ocr_result, "найти игрока")
+    width, height = get_screen_size(ctx)
     if coords:
-        ctx.android.tap(coords["x"], coords["y"])
+        ctx.android.tap(max(coords["x"], int(width * 0.42)), coords["y"])
     else:
-        width, height = get_screen_size(ctx)
         ctx.android.tap(width // 2, int(height * 0.35))
-    time.sleep(0.5)
+    time.sleep(0.8)
     return True
 
 
 def clear_search_field(ctx: LiveContext) -> None:
+    captured = ctx.capture("invite_clear_search")
+    if captured:
+        ocr_result, _, _ = captured
+        coords = find_line_center(ocr_result, "сбросить") or find_line_center(ocr_result, "найти игрока")
+        if coords:
+            width, _ = get_screen_size(ctx)
+            ctx.android.tap(int(width * 0.92), coords["y"])
+            time.sleep(0.7)
+            return
     width, height = get_screen_size(ctx)
-    ctx.android.tap(int(width * 0.92), int(height * 0.35))
+    ctx.android.tap(int(width * 0.92), int(height * 0.42))
     time.sleep(0.5)
 
 
@@ -607,12 +636,18 @@ def candidate_player_result_lines(lines: list[OCRLine]) -> list[OCRLine]:
     for line in lines:
         text = line.text.strip()
         lower = text.lower()
-        if "игроки рядом" in lower:
+        if "игроки рядом" in lower or lower == "игроки":
             active = True
             continue
         if "игроки в других городах" in lower:
             break
         if not active:
+            continue
+        if (
+            lower in {"рядом", "пригласить"}
+            or "adb keyboard" in lower
+            or re.fullmatch(r"\(?[A-ZА-ЯЁ]{1,3}\)?", text)
+        ):
             continue
         if "санкт-петербург" in lower or re.search(r"\b[lr]+\s*\|\s*\d", lower):
             continue
@@ -643,8 +678,9 @@ def ensure_adb_keyboard(ctx: LiveContext) -> None:
 def send_unicode_text(ctx: LiveContext, value: str) -> None:
     adb_path = getattr(ctx.android, "adb_path", "adb")
     device_id = getattr(ctx.android, "device_id", "") or select_adb_device()
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
     subprocess.run(
-        [adb_path, "-s", device_id, "shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT", "--es", "msg", value],
+        [adb_path, "-s", device_id, "shell", "am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg", encoded],
         capture_output=True,
         text=True,
         timeout=10,
