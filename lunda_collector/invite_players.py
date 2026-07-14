@@ -472,10 +472,12 @@ def run_invite_job(conn, ctx: LiveContext, *, job_id: int) -> int:
         if not open_invite_screen(ctx):
             raise RuntimeError("invite screen was not opened")
         disable_only_partners(ctx)
-        for name in players:
+        for index, name in enumerate(players):
             result = invite_one_player(ctx, str(name))
             stats[result] = stats.get(result, 0) + 1
             log_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+            if result != "selected" or index < len(players) - 1:
+                clear_search_field(ctx)
         if stats["selected"] > 0 and not tap_final_invite_button(ctx):
             raise RuntimeError("final invite button was not tapped")
         conn.execute(
@@ -577,7 +579,6 @@ def invite_one_player(ctx: LiveContext, name: str) -> str:
     send_unicode_text(ctx, name)
     time.sleep(2.0)
     selected = select_search_results(ctx)
-    clear_search_field(ctx)
     return "selected" if selected else "not_found"
 
 
@@ -658,8 +659,18 @@ def candidate_player_result_lines(lines: list[OCRLine]) -> list[OCRLine]:
 
 def tap_final_invite_button(ctx: LiveContext) -> bool:
     width, height = get_screen_size(ctx)
-    ctx.android.tap(width // 2, int(height * 0.92))
+    captured = ctx.capture("invite_final_button_before_tap")
+    if captured:
+        ocr_result, _, _ = captured
+        coords = find_bottom_line_center(ocr_result, "пригласить")
+        if coords:
+            ctx.android.tap(coords["x"], coords["y"])
+        else:
+            ctx.android.tap(width // 2, int(height * 0.88))
+    else:
+        ctx.android.tap(width // 2, int(height * 0.88))
     time.sleep(2.0)
+    ctx.capture("invite_final_button_after_tap")
     return True
 
 
@@ -693,6 +704,19 @@ def find_line_center(ocr_result: dict[str, Any], needle: str) -> dict[str, int] 
         if needle_lower in line.text.lower():
             return {"x": (line.x_min + line.x_max) // 2, "y": (line.y_min + line.y_max) // 2, "text": line.text}
     return None
+
+
+def find_bottom_line_center(ocr_result: dict[str, Any], needle: str) -> dict[str, int] | None:
+    needle_lower = needle.lower()
+    matches = [
+        line
+        for line in extract_ocr_lines(ocr_result)
+        if needle_lower in line.text.lower()
+    ]
+    if not matches:
+        return None
+    line = max(matches, key=lambda item: item.y_min)
+    return {"x": (line.x_min + line.x_max) // 2, "y": (line.y_min + line.y_max) // 2, "text": line.text}
 
 
 def list_active_my_tournaments(conn, *, limit: int = 20):
