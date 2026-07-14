@@ -124,16 +124,9 @@ def handle_callback(conn, callback: dict) -> None:
         session_id = create_invite_session(conn, user_id=user_id, tournament_id=tournament_id)
         answer_callback(callback_id, "Жду Excel")
         tournament_label = invite_tournament_label(conn, tournament_id)
-        if chat_id and message_id:
-            edit_message_text(
-                chat_id,
-                int(message_id),
-                f"✅ Турнир выбран\n{tournament_label}\n\nТеперь отправь Excel-файл с именами игроков в первом столбце.",
-            )
-        else:
-            send_admin_message(
-                f"✅ Турнир выбран\n{tournament_label}\n\nТеперь отправь Excel-файл с именами игроков в первом столбце."
-            )
+        send_admin_message(
+            f"✅ Турнир выбран\n{tournament_label}\n\nТеперь отправь Excel-файл с именами игроков в первом столбце."
+        )
         print(f"invite session {session_id}: tournament {tournament_id} selected", flush=True)
         return
 
@@ -152,10 +145,7 @@ def handle_callback(conn, callback: dict) -> None:
         conn.commit()
         answer_callback(callback_id, "Запускаю")
         text = f"✅ Хорошо, задача #{job_id} создана.\nИгроков: {len(names)}.\nПриглашения идут."
-        if chat_id and message_id:
-            edit_message_text(chat_id, int(message_id), text)
-        else:
-            send_admin_message(text)
+        send_admin_message(text)
         print(f"invite session {session_id}: job {job_id} queued", flush=True)
         return
 
@@ -167,10 +157,7 @@ def handle_callback(conn, callback: dict) -> None:
         )
         conn.commit()
         answer_callback(callback_id, "Отменено")
-        if chat_id and message_id:
-            edit_message_text(chat_id, int(message_id), "❌ Приглашение отменено.")
-        else:
-            send_admin_message("❌ Приглашение отменено.")
+        send_admin_message("❌ Приглашение отменено.")
         return
 
     parts = data.split(":")
