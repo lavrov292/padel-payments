@@ -144,7 +144,7 @@ def handle_callback(conn, callback: dict) -> None:
         )
         conn.commit()
         answer_callback(callback_id, "Запускаю")
-        text = f"✅ Хорошо, задача #{job_id} создана.\nИгроков: {len(names)}.\nПриглашения идут."
+        text = f"✅ Хорошо, принял.\nЗадача #{job_id} в очереди.\nИгроков: {len(names)}."
         send_admin_message(text)
         print(f"invite session {session_id}: job {job_id} queued", flush=True)
         return
@@ -277,14 +277,10 @@ def get_invite_session(conn, *, session_id: int, user_id: str):
 
 
 def invite_confirmation_message(conn, *, tournament_id: int, names: list[str]) -> str:
-    preview = "\n".join(f"• {name}" for name in names[:10])
-    if len(names) > 10:
-        preview += f"\n…и еще {len(names) - 10}"
     return (
         "Excel получил.\n\n"
         f"Турнир:\n{invite_tournament_label(conn, tournament_id)}\n\n"
         f"Игроков в файле: {len(names)}\n"
-        f"{preview}\n\n"
         "Начать отправку приглашений?"
     )
 

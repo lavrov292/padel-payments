@@ -599,16 +599,19 @@ def focus_search_field(ctx: LiveContext) -> bool:
 
 def clear_search_field(ctx: LiveContext) -> None:
     captured = ctx.capture("invite_clear_search")
+    width, height = get_screen_size(ctx)
     if captured:
         ocr_result, _, _ = captured
-        coords = find_line_center(ocr_result, "сбросить") or find_line_center(ocr_result, "найти игрока")
-        if coords:
-            width, _ = get_screen_size(ctx)
-            ctx.android.tap(int(width * 0.92), coords["y"])
+        y = search_field_y(ocr_result)
+        if y:
+            ctx.android.tap(int(width * 0.45), y)
+            time.sleep(0.3)
+            delete_search_text(ctx, repeats=45)
             time.sleep(0.7)
             return
-    width, height = get_screen_size(ctx)
-    ctx.android.tap(int(width * 0.92), int(height * 0.42))
+    ctx.android.tap(width // 2, int(height * 0.42))
+    time.sleep(0.3)
+    delete_search_text(ctx, repeats=45)
     time.sleep(0.5)
 
 
@@ -698,6 +701,24 @@ def send_unicode_text(ctx: LiveContext, value: str) -> None:
     )
 
 
+def delete_search_text(ctx: LiveContext, *, repeats: int) -> None:
+    adb_path = getattr(ctx.android, "adb_path", "adb")
+    device_id = getattr(ctx.android, "device_id", "") or select_adb_device()
+    subprocess.run(
+        [adb_path, "-s", device_id, "shell", "input", "keyevent", "123"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    for _ in range(repeats):
+        subprocess.run(
+            [adb_path, "-s", device_id, "shell", "input", "keyevent", "67"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+
 def find_line_center(ocr_result: dict[str, Any], needle: str) -> dict[str, int] | None:
     needle_lower = needle.lower()
     for line in extract_ocr_lines(ocr_result):
@@ -717,6 +738,31 @@ def find_bottom_line_center(ocr_result: dict[str, Any], needle: str) -> dict[str
         return None
     line = max(matches, key=lambda item: item.y_min)
     return {"x": (line.x_min + line.x_max) // 2, "y": (line.y_min + line.y_max) // 2, "text": line.text}
+
+
+def search_field_y(ocr_result: dict[str, Any]) -> int | None:
+    placeholder = find_line_center(ocr_result, "найти игрока")
+    if placeholder:
+        return placeholder["y"]
+    lines = extract_ocr_lines(ocr_result)
+    top = find_line_center(ocr_result, "только мои напарники")
+    bottom = find_line_center(ocr_result, "доступно для приглашения")
+    if not top or not bottom:
+        return None
+    candidates = []
+    for line in lines:
+        center_y = (line.y_min + line.y_max) // 2
+        lower = line.text.lower().strip()
+        if not (top["y"] < center_y < bottom["y"]):
+            continue
+        if "сбросить" in lower or "только мои" in lower or "доступно" in lower:
+            continue
+        if re.search(r"[A-Za-zА-Яа-яЁё]{2,}", line.text):
+            candidates.append(line)
+    if not candidates:
+        return None
+    line = min(candidates, key=lambda item: item.y_min)
+    return (line.y_min + line.y_max) // 2
 
 
 def list_active_my_tournaments(conn, *, limit: int = 20):
