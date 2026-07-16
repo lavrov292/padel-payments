@@ -177,7 +177,7 @@ def read_player_names_from_xlsx(path: Path) -> list[str]:
         value = str(row[0] or "").strip()
         if not value:
             continue
-        if value.lower() in {"player_name", "name", "имя", "игрок", "player"}:
+        if value.lower() in {"player_name", "name", "имя", "фио", "игрок", "player"}:
             continue
         normalized = re.sub(r"\s+", " ", value)
         if normalized not in names:
@@ -261,6 +261,11 @@ def open_my_events_screen(ctx: LiveContext, *, force_home: bool = False) -> bool
         ocr_result, text, _ = captured
         if is_my_events_screen(text):
             return True
+        if is_main_home_screen(text):
+            width, height = get_screen_size(ctx)
+            ctx.android.tap(int(width * 0.93), int(height * 0.225))
+            time.sleep(2.0)
+            continue
         coords = find_line_center(ocr_result, "календарь моих событий") or find_line_center(ocr_result, "календарь моих")
         if coords:
             ctx.android.tap(coords["x"], coords["y"])
@@ -279,9 +284,11 @@ def ensure_main_home_screen(ctx: LiveContext) -> bool:
             continue
         _, text, _ = captured
         lower = text.lower()
-        if "ваш город" in lower and has_my_events_header(lower):
+        if is_main_home_screen(text):
             return True
         if "главная" in lower and "играть" in lower:
+            tap_lunda_bottom_nav(ctx, "играть")
+            time.sleep(1.5)
             tap_lunda_bottom_nav(ctx, "главная")
             time.sleep(2.0)
             continue
@@ -299,7 +306,7 @@ def ensure_home_screen(ctx: LiveContext) -> bool:
         lower = text.lower()
         if is_my_events_screen(text):
             return True
-        if "ваш город" in lower and has_my_events_header(lower):
+        if is_main_home_screen(text):
             return True
         if "главная" in lower and "играть" in lower:
             tap_lunda_bottom_nav(ctx, "главная")
@@ -315,8 +322,15 @@ def has_my_events_header(text: str) -> bool:
     return "календарь моих событий" in lower or ("календарь моих" in lower and "событий" in lower)
 
 
+def is_main_home_screen(text: str) -> bool:
+    lower = text.lower()
+    return "ваш город" in lower and has_my_events_header(lower)
+
+
 def is_my_events_screen(text: str) -> bool:
     lower = text.lower()
+    if "главная" in lower and "играть" in lower and "рейтинг" in lower:
+        return False
     return has_my_events_header(lower) and "бронирования" in lower and ("июль" in lower or "турнир" in lower)
 
 
